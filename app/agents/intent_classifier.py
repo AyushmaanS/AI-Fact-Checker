@@ -1,9 +1,5 @@
-from openai import OpenAI
-
-from app.config import OPENAI_API_KEY
+from app.llm_client import MODEL_GPT4O_MINI, get_llm_client
 from app.models.schemas import ContentIntent
-
-_client: OpenAI | None = None
 
 SYSTEM_PROMPT = (
     "You classify a piece of text by its intent, ahead of any fact-checking. "
@@ -17,18 +13,9 @@ SYSTEM_PROMPT = (
 )
 
 
-def _get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY must be set in .env")
-        _client = OpenAI(api_key=OPENAI_API_KEY)
-    return _client
-
-
 def classify_intent(text: str) -> ContentIntent:
-    completion = _get_client().chat.completions.parse(
-        model="gpt-4o-mini",
+    completion = get_llm_client().chat.completions.parse(
+        model=MODEL_GPT4O_MINI,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": text},

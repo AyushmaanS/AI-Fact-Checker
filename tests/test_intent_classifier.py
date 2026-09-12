@@ -4,11 +4,11 @@ from pathlib import Path
 import pytest
 
 from app.agents.intent_classifier import classify_intent
-from app.config import OPENAI_API_KEY
+from app.config import FASTROUTER_API_KEY
 
 pytestmark = pytest.mark.skipif(
-    not OPENAI_API_KEY,
-    reason="OPENAI_API_KEY not set in .env",
+    not FASTROUTER_API_KEY,
+    reason="FASTROUTER_API_KEY not set in .env",
 )
 
 CASES_PATH = Path(__file__).parent.parent / "eval" / "cases" / "intent_examples.json"

@@ -1,0 +1,22 @@
+from openai import OpenAI
+
+from app.config import FASTROUTER_API_KEY
+
+# FastRouter (https://fastrouter.ai) is an OpenAI-SDK-compatible gateway - same
+# client, same chat.completions.parse() structured-output API, just routed
+# through their endpoint with provider-prefixed, dated model IDs.
+BASE_URL = "https://api.fastrouter.ai/api/v1"
+
+MODEL_GPT4O = "openai/gpt-4o-2024-05-13"
+MODEL_GPT4O_MINI = "openai/gpt-4o-mini-2024-07-18"
+
+_client: OpenAI | None = None
+
+
+def get_llm_client() -> OpenAI:
+    global _client
+    if _client is None:
+        if not FASTROUTER_API_KEY:
+            raise RuntimeError("FASTROUTER_API_KEY must be set in .env")
+        _client = OpenAI(base_url=BASE_URL, api_key=FASTROUTER_API_KEY)
+    return _client
