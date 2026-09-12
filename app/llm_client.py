@@ -7,7 +7,9 @@ from app.config import FASTROUTER_API_KEY
 # through their endpoint with provider-prefixed, dated model IDs.
 BASE_URL = "https://api.fastrouter.ai/api/v1"
 
-MODEL_GPT4O = "openai/gpt-4o-2024-05-13"
+# NOTE: gpt-4o-2024-05-13 does NOT support response_format=json_schema (Structured
+# Outputs shipped with the 2024-08-06 snapshot) - use a later dated snapshot here.
+MODEL_GPT4O = "openai/gpt-4o-2024-11-20"
 MODEL_GPT4O_MINI = "openai/gpt-4o-mini-2024-07-18"
 
 _client: OpenAI | None = None
