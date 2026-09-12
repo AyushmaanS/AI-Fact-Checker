@@ -72,3 +72,8 @@ def insert_verdict(
 def get_verdict(verdict_id: str) -> dict | None:
     result = get_client().table("verdicts").select("*").eq("id", verdict_id).execute()
     return result.data[0] if result.data else None
+
+
+def list_source_credibility() -> list[dict]:
+    result = get_client().table("source_credibility").select("*").execute()
+    return result.data
