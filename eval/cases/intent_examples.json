@@ -1,0 +1,62 @@
+[
+  {
+    "text": "The unemployment rate in the United States was 3.7% in October 2023.",
+    "expected_label": "FACTUAL_CLAIM"
+  },
+  {
+    "text": "The Great Wall of China is over 13,000 miles long.",
+    "expected_label": "FACTUAL_CLAIM"
+  },
+  {
+    "text": "Drinking eight glasses of water a day is required for good health.",
+    "expected_label": "FACTUAL_CLAIM"
+  },
+  {
+    "text": "The new Marvel movie was honestly kind of boring.",
+    "expected_label": "OPINION"
+  },
+  {
+    "text": "Pineapple absolutely belongs on pizza.",
+    "expected_label": "OPINION"
+  },
+  {
+    "text": "This is the best smartphone camera I've ever used.",
+    "expected_label": "OPINION"
+  },
+  {
+    "text": "Local man discovers his houseplant has been secretly running a small hedge fund.",
+    "expected_label": "SATIRE_COMEDY"
+  },
+  {
+    "text": "Scientists confirm Mondays are, in fact, cursed.",
+    "expected_label": "SATIRE_COMEDY"
+  },
+  {
+    "text": "Area dad insists he's 'basically fluent' in French after watching one subtitled film.",
+    "expected_label": "SATIRE_COMEDY"
+  },
+  {
+    "text": "The dragon unfurled its wings and soared over the crumbling castle walls.",
+    "expected_label": "FICTIONAL_CREATIVE"
+  },
+  {
+    "text": "In the year 3021, humanity had long since abandoned Earth for the rings of Saturn.",
+    "expected_label": "FICTIONAL_CREATIVE"
+  },
+  {
+    "text": "She whispered a spell under her breath, and the candle flames turned violet.",
+    "expected_label": "FICTIONAL_CREATIVE"
+  },
+  {
+    "text": "Hey, how's it going?",
+    "expected_label": "UNRELATED"
+  },
+  {
+    "text": "Can you recommend a good pasta recipe?",
+    "expected_label": "UNRELATED"
+  },
+  {
+    "text": "lol ok thanks!",
+    "expected_label": "UNRELATED"
+  }
+]
