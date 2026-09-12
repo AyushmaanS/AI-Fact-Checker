@@ -43,6 +43,21 @@ requirements, and sprint plan. Each sprint's Claude Code prompt lives in
 5. Check it's alive: `http://127.0.0.1:8000/health`, or
    `http://127.0.0.1:8000/docs` for the interactive Swagger UI.
 
+## Database (Supabase)
+
+1. Create a free project at [supabase.com](https://supabase.com).
+2. Open **SQL Editor** in the Supabase dashboard, paste in the contents of
+   [`app/db/schema.sql`](app/db/schema.sql), and run it. This creates the
+   `submissions`, `claims`, `verdicts`, and `source_credibility` tables and
+   seeds the credibility-weight table.
+3. In **Project Settings → API**, copy the **Project URL** and the
+   **anon/public API key**.
+4. Put them in `.env` as `SUPABASE_URL` and `SUPABASE_KEY`.
+
+`tests/test_db.py` auto-skips until these are set, so the rest of the suite
+runs fine without a Supabase project — the DB tests activate the moment
+`.env` has real values.
+
 ## Tests
 
 ```bash
