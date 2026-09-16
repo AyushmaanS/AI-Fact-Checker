@@ -1,3 +1,4 @@
+import asyncio
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -5,7 +6,7 @@ from pydantic import BaseModel
 
 from app.agents.research_agent import RawSearchResult
 from app.db.client import list_source_credibility
-from app.llm_client import MODEL_GPT4O_MINI, get_llm_client
+from app.llm_client import MODEL_GPT4O_MINI, get_async_llm_client
 from app.models.schemas import Claim, EvidenceItem, EvidencePackage
 
 DEFAULT_CATEGORY = "Unclassified"
@@ -52,13 +53,13 @@ def _lookup_credibility(domain: str, table: list[dict]) -> tuple[str, float]:
     return DEFAULT_CATEGORY, DEFAULT_WEIGHT
 
 
-def _classify_stances(claim_text: str, results: list[RawSearchResult]) -> list[str]:
+async def _classify_stances(claim_text: str, results: list[RawSearchResult]) -> list[str]:
     if not results:
         return []
     numbered = "\n".join(f"{i}. {r.title} - {r.snippet}" for i, r in enumerate(results))
     user_content = f"Claim: {claim_text}\n\nEvidence items:\n{numbered}"
 
-    completion = get_llm_client().chat.completions.parse(
+    completion = await get_async_llm_client().chat.completions.parse(
         model=MODEL_GPT4O_MINI,
         messages=[
             {"role": "system", "content": STANCE_SYSTEM_PROMPT},
@@ -70,9 +71,11 @@ def _classify_stances(claim_text: str, results: list[RawSearchResult]) -> list[s
     return [stance_map.get(i, "for") for i in range(len(results))]
 
 
-def rank_evidence(claim: Claim, raw_results: list[RawSearchResult]) -> EvidencePackage:
-    credibility_table = _get_credibility_table()
-    stances = _classify_stances(claim.text, raw_results)
+async def rank_evidence(claim: Claim, raw_results: list[RawSearchResult]) -> EvidencePackage:
+    # _get_credibility_table is sync (cached after its first Supabase call) - run it
+    # off the event loop so it can never block other claims' concurrent work.
+    credibility_table = await asyncio.to_thread(_get_credibility_table)
+    stances = await _classify_stances(claim.text, raw_results)
 
     evidence_for: list[EvidenceItem] = []
     evidence_against: list[EvidenceItem] = []

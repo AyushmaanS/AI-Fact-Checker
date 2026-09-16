@@ -1,4 +1,4 @@
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from app.config import FASTROUTER_API_KEY
 
@@ -13,6 +13,7 @@ MODEL_GPT4O = "openai/gpt-4o-2024-11-20"
 MODEL_GPT4O_MINI = "openai/gpt-4o-mini-2024-07-18"
 
 _client: OpenAI | None = None
+_async_client: AsyncOpenAI | None = None
 
 
 def get_llm_client() -> OpenAI:
@@ -22,3 +23,12 @@ def get_llm_client() -> OpenAI:
             raise RuntimeError("FASTROUTER_API_KEY must be set in .env")
         _client = OpenAI(base_url=BASE_URL, api_key=FASTROUTER_API_KEY)
     return _client
+
+
+def get_async_llm_client() -> AsyncOpenAI:
+    global _async_client
+    if _async_client is None:
+        if not FASTROUTER_API_KEY:
+            raise RuntimeError("FASTROUTER_API_KEY must be set in .env")
+        _async_client = AsyncOpenAI(base_url=BASE_URL, api_key=FASTROUTER_API_KEY)
+    return _async_client

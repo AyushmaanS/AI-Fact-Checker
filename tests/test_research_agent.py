@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -18,22 +18,24 @@ def _sample_claim() -> Claim:
 
 
 @patch("app.agents.research_agent.decompose_query")
-@patch("app.agents.research_agent._get_tavily_client")
-def test_research_claim_with_mocked_tavily(mock_get_client, mock_decompose):
+@patch("app.agents.research_agent._get_async_tavily_client")
+async def test_research_claim_with_mocked_tavily(mock_get_client, mock_decompose):
     mock_decompose.return_value = ["Eiffel Tower completion year"]
     mock_client = MagicMock()
-    mock_client.search.return_value = {
-        "results": [
-            {
-                "title": "Eiffel Tower - Wikipedia",
-                "url": "https://en.wikipedia.org/wiki/Eiffel_Tower",
-                "content": "The Eiffel Tower was completed in 1889...",
-            }
-        ]
-    }
+    mock_client.search = AsyncMock(
+        return_value={
+            "results": [
+                {
+                    "title": "Eiffel Tower - Wikipedia",
+                    "url": "https://en.wikipedia.org/wiki/Eiffel_Tower",
+                    "content": "The Eiffel Tower was completed in 1889...",
+                }
+            ]
+        }
+    )
     mock_get_client.return_value = mock_client
 
-    results = research_claim(_sample_claim())
+    results = await research_claim(_sample_claim())
 
     assert len(results) == 1
     assert results[0].url == "https://en.wikipedia.org/wiki/Eiffel_Tower"
@@ -46,8 +48,8 @@ def test_research_claim_with_mocked_tavily(mock_get_client, mock_decompose):
     not (TAVILY_API_KEY and FASTROUTER_API_KEY),
     reason="TAVILY_API_KEY / FASTROUTER_API_KEY not set in .env",
 )
-def test_research_claim_live():
-    results = research_claim(_sample_claim())
+async def test_research_claim_live():
+    results = await research_claim(_sample_claim())
     assert len(results) > 0
     for r in results:
         assert r.url.startswith("http")

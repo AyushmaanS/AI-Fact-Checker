@@ -33,6 +33,7 @@ pydantic_core==2.46.5
 Pygments==2.21.0
 PyJWT==2.14.0
 pytest==9.1.1
+pytest-asyncio==1.4.0
 python-dotenv==1.2.3
 PyYAML==6.0.3
 realtime==2.31.0

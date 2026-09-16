@@ -60,11 +60,11 @@ def test_lookup_credibility_matches_known_domain():
 
 @patch("app.agents.evidence_ranker._classify_stances")
 @patch("app.agents.evidence_ranker._get_credibility_table")
-def test_rank_evidence_sorts_by_credibility_descending(mock_table, mock_stances):
+async def test_rank_evidence_sorts_by_credibility_descending(mock_table, mock_stances):
     mock_table.return_value = FAKE_CREDIBILITY_TABLE
     mock_stances.return_value = ["for", "for", "against"]
 
-    package = rank_evidence(_claim(), _raw_results())
+    package = await rank_evidence(_claim(), _raw_results())
 
     assert len(package.evidence_for) == 2
     assert len(package.evidence_against) == 1
@@ -77,11 +77,11 @@ def test_rank_evidence_sorts_by_credibility_descending(mock_table, mock_stances)
 
 @patch("app.agents.evidence_ranker._classify_stances")
 @patch("app.agents.evidence_ranker._get_credibility_table")
-def test_rank_evidence_handles_no_results(mock_table, mock_stances):
+async def test_rank_evidence_handles_no_results(mock_table, mock_stances):
     mock_table.return_value = FAKE_CREDIBILITY_TABLE
     mock_stances.return_value = []
 
-    package = rank_evidence(_claim(), [])
+    package = await rank_evidence(_claim(), [])
 
     assert package.evidence_for == []
     assert package.evidence_against == []
@@ -92,7 +92,7 @@ def test_rank_evidence_handles_no_results(mock_table, mock_stances):
     not (TAVILY_API_KEY and FASTROUTER_API_KEY and SUPABASE_URL and SUPABASE_KEY),
     reason="TAVILY_API_KEY / FASTROUTER_API_KEY / SUPABASE_URL / SUPABASE_KEY not set in .env",
 )
-def test_rank_evidence_live():
+async def test_rank_evidence_live():
     claim = Claim(
         claim_id="c1",
         text="The Eiffel Tower was completed in 1889.",
@@ -100,8 +100,8 @@ def test_rank_evidence_live():
         specificity="specific",
         verifiability_score=1.0,
     )
-    raw_results = research_claim(claim)
-    package = rank_evidence(claim, raw_results)
+    raw_results = await research_claim(claim)
+    package = await rank_evidence(claim, raw_results)
 
     assert len(package.evidence_for) + len(package.evidence_against) == len(raw_results)
     for lst in (package.evidence_for, package.evidence_against):
