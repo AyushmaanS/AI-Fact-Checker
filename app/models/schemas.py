@@ -31,6 +31,9 @@ class EvidencePackage(BaseModel):
     evidence_for: list[EvidenceItem]
     evidence_against: list[EvidenceItem]
     sources: list[str]
+    # Capped weighted-evidence-score: sum(credibility_weight) over each side's top
+    # EVIDENCE_CAP items, then for_score / (for_score + against_score) - 0.5 if
+    # there's no evidence at all. See evidence_ranker.compute_evidence_score.
     confidence_raw: float
 
 
@@ -38,7 +41,6 @@ class AnalystOutput(BaseModel):
     claim_id: str
     for_summary: str
     against_summary: str  # MUST be populated - see functional spec A.5
-    fringe_vs_consensus_note: Optional[str] = None
     outdated_flag: bool = False
 
 

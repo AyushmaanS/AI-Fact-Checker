@@ -58,13 +58,12 @@ class EvidencePackage(BaseModel):
     evidence_for: list[EvidenceItem]
     evidence_against: list[EvidenceItem]
     sources: list[str]
-    confidence_raw: float
+    confidence_raw: float        # capped weighted-evidence-score — see A.3 note below
 
 class AnalystOutput(BaseModel):
     claim_id: str
     for_summary: str
     against_summary: str        # MUST be populated — see A.5
-    fringe_vs_consensus_note: Optional[str] = None
     outdated_flag: bool = False
 
 class Verdict(BaseModel):
@@ -92,8 +91,8 @@ class VerifyResponse(BaseModel):
 | **Content Intent Classifier** | raw text | `ContentIntent` | Only `FACTUAL_CLAIM` proceeds. All others short-circuit with a canned response (e.g., `OPINION` → "This reads as opinion, not a checkable claim."). |
 | **Claim Extractor** | raw text | `list[Claim]` | Must handle 0 claims (return empty list → API responds "no verifiable claims found"), 1 claim, and multi-claim paragraphs. |
 | **Research Agent** (×N, parallel) | one `Claim` | `EvidencePackage` | Internally: Query Decomposer (3–5 search queries) → Tavily search calls → raw results. Capped at 8 concurrent; >8 claims batch in groups of 8. |
-| **Evidence Ranker** | raw search results + `Claim` | `EvidencePackage` (scored) | Applies the credibility-weight table; sorts by credibility × relevance × recency. |
-| **Analyst Agent** | `EvidencePackage` | `AnalystOutput` | `against_summary` is **never blank** — if no contradicting evidence exists, it must literally contain "No contradicting evidence found in searched sources." |
+| **Evidence Ranker** | raw search results + `Claim` | `EvidencePackage` (scored) | Applies the credibility-weight table; sorts by credibility × relevance × recency. Also computes `confidence_raw` as a **capped weighted-evidence-score**: take each side's top `EVIDENCE_CAP` (5) items by `credibility_weight`, sum each side's weights, `confidence_raw = for_score / (for_score + against_score)` (0.5 if there's no evidence at all). The cap exists so a flood of low-credibility sources can't outvote a few highly-credible ones (e.g. 2 sources at weight ≥0.90 against a claim correctly outweighs 15 sources at weight 0.10–0.30 for it) — see `evidence_ranker.compute_evidence_score`. |
+| **Analyst Agent** | `Claim` + `EvidencePackage` | `AnalystOutput` | `against_summary` is **never blank** — if no contradicting evidence exists, it must literally contain "No contradicting evidence found in searched sources" (and symmetrically for `for_summary`). Evidence-balance scoring (the old fringe-vs-consensus threshold check) has moved entirely to the Evidence Ranker's `confidence_raw` — the Analyst Agent's job is strictly the two summaries plus `outdated_flag`, nothing about evidence weighting. |
 | **Verdict Agent** | `Claim` + `AnalystOutput` | `Verdict` | Citation-enforced: every sentence asserting a fact must reference a citation index. A schema validator rejects/retries output where a factual sentence has no citation. |
 | **Citation Verifier** | `Verdict.citations` | adjusted `Verdict` | Fetches each URL, text-searches for the attributed claim. Missing/mismatched → citation removed, `confidence_score` reduced proportionally. |
 | **Response Formatter** | final `Verdict[]` | `VerifyResponse` | Assembles the API response; computes `aggregate_label` when >1 claim (simple rule: worst-case label wins, e.g., any FALSE claim makes the aggregate at least PARTIALLY_TRUE). |

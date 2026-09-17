@@ -11,6 +11,7 @@ from app.models.schemas import Claim, EvidenceItem, EvidencePackage
 
 DEFAULT_CATEGORY = "Unclassified"
 DEFAULT_WEIGHT = 0.4
+EVIDENCE_CAP = 5
 
 STANCE_SYSTEM_PROMPT = (
     "You judge whether each piece of evidence supports (\"for\") or contradicts "
@@ -71,6 +72,19 @@ async def _classify_stances(claim_text: str, results: list[RawSearchResult]) -> 
     return [stance_map.get(i, "for") for i in range(len(results))]
 
 
+def compute_evidence_score(
+    evidence_for: list[EvidenceItem], evidence_against: list[EvidenceItem]
+) -> float:
+    top_for = sorted(evidence_for, key=lambda e: e.credibility_weight, reverse=True)[:EVIDENCE_CAP]
+    top_against = sorted(evidence_against, key=lambda e: e.credibility_weight, reverse=True)[:EVIDENCE_CAP]
+    for_score = sum(e.credibility_weight for e in top_for)
+    against_score = sum(e.credibility_weight for e in top_against)
+    total = for_score + against_score
+    if total == 0:
+        return 0.5
+    return for_score / total
+
+
 async def rank_evidence(claim: Claim, raw_results: list[RawSearchResult]) -> EvidencePackage:
     # _get_credibility_table is sync (cached after its first Supabase call) - run it
     # off the event loop so it can never block other claims' concurrent work.
@@ -98,10 +112,7 @@ async def rank_evidence(claim: Claim, raw_results: list[RawSearchResult]) -> Evi
     evidence_for.sort(key=lambda i: i.credibility_weight, reverse=True)
     evidence_against.sort(key=lambda i: i.credibility_weight, reverse=True)
 
-    for_weight = sum(i.credibility_weight for i in evidence_for)
-    against_weight = sum(i.credibility_weight for i in evidence_against)
-    total_weight = for_weight + against_weight
-    confidence_raw = for_weight / total_weight if total_weight > 0 else 0.5
+    confidence_raw = compute_evidence_score(evidence_for, evidence_against)
 
     return EvidencePackage(
         claim_id=claim.claim_id,

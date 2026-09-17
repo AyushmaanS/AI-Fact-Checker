@@ -133,6 +133,8 @@
 
 **Definition of Done:** A one-sided test case still produces a non-empty, correctly-worded `against_summary`.
 
+> ⚠️ **Superseded post-Sprint 7:** the fringe-vs-consensus threshold check described above (and `AnalystOutput.fringe_vs_consensus_note`) was removed and replaced with a single capped weighted-evidence-score computed in the Evidence Ranker (`EvidencePackage.confidence_raw`, via `evidence_ranker.compute_evidence_score`) — see `docs/phase1-2-functional-spec.md` §A.2/§A.3 for the current behavior. The prompt text above is kept as the historical record of what Sprint 7 originally built; it is no longer what the code does.
+
 ---
 
 ### Sprint 8 — Verdict Agent + Citation-Enforcement Validator

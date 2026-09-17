@@ -6,7 +6,6 @@ from app.agents.analyst_agent import (
     NO_AGAINST_EVIDENCE_TEXT,
     NO_FOR_EVIDENCE_TEXT,
     _AnalystLLMOutput,
-    _detect_fringe_vs_consensus,
     analyze_evidence,
 )
 from app.agents.evidence_ranker import rank_evidence
@@ -51,7 +50,6 @@ async def test_fully_empty_evidence_never_calls_llm():
     assert result.for_summary == NO_FOR_EVIDENCE_TEXT
     assert result.against_summary == NO_AGAINST_EVIDENCE_TEXT
     assert result.outdated_flag is False
-    assert result.fringe_vs_consensus_note is None
 
 
 @patch("app.agents.analyst_agent.get_async_llm_client")
@@ -80,28 +78,6 @@ async def test_one_sided_evidence_gets_deterministic_against_summary(mock_get_cl
 
     assert result.against_summary == NO_AGAINST_EVIDENCE_TEXT
     assert result.for_summary == "Multiple credible sources confirm this."
-
-
-def test_fringe_vs_consensus_detected():
-    # 10 credible items (9 for @0.95, 1 against @0.8) = exactly 90% credible consensus,
-    # plus one low-credibility dissenter to trigger the note.
-    evidence_for = [_evidence_item(0.95, "for") for _ in range(9)]
-    evidence_against = [_evidence_item(0.8, "against"), _evidence_item(0.2, "against")]
-    note = _detect_fringe_vs_consensus(evidence_for, evidence_against)
-    assert note is not None
-    assert "90%" in note
-
-
-def test_fringe_vs_consensus_not_triggered_when_credible_sources_split():
-    evidence_for = [_evidence_item(0.8, "for") for _ in range(5)]
-    evidence_against = [_evidence_item(0.8, "against") for _ in range(5)]
-    assert _detect_fringe_vs_consensus(evidence_for, evidence_against) is None
-
-
-def test_fringe_vs_consensus_not_triggered_when_dissent_is_also_credible():
-    evidence_for = [_evidence_item(0.95, "for") for _ in range(9)]
-    evidence_against = [_evidence_item(0.8, "against")]  # 0.8 >= 0.75, not "low-credibility"
-    assert _detect_fringe_vs_consensus(evidence_for, evidence_against) is None
 
 
 @pytest.mark.skipif(

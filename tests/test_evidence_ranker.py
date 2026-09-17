@@ -2,10 +2,15 @@ from unittest.mock import patch
 
 import pytest
 
-from app.agents.evidence_ranker import _domain_from_url, _lookup_credibility, rank_evidence
+from app.agents.evidence_ranker import (
+    _domain_from_url,
+    _lookup_credibility,
+    compute_evidence_score,
+    rank_evidence,
+)
 from app.agents.research_agent import RawSearchResult, research_claim
 from app.config import FASTROUTER_API_KEY, SUPABASE_KEY, SUPABASE_URL, TAVILY_API_KEY
-from app.models.schemas import Claim
+from app.models.schemas import Claim, EvidenceItem
 
 FAKE_CREDIBILITY_TABLE = [
     {"domain_pattern": "reuters.com", "category": "Major Wire Services", "weight": 0.82},
@@ -39,6 +44,49 @@ def _raw_results() -> list[RawSearchResult]:
             snippet="disputes it", query="q1",
         ),
     ]
+
+
+def _evidence_item(weight: float, stance: str) -> EvidenceItem:
+    return EvidenceItem(
+        source_url="https://example.com",
+        source_category="Test",
+        credibility_weight=weight,
+        excerpt="evidence",
+        stance=stance,
+    )
+
+
+def test_compute_evidence_score_normal_mixed_matches_manual_calculation():
+    evidence_for = [_evidence_item(0.9, "for"), _evidence_item(0.7, "for"), _evidence_item(0.5, "for")]
+    evidence_against = [_evidence_item(0.8, "against"), _evidence_item(0.3, "against")]
+
+    score = compute_evidence_score(evidence_for, evidence_against)
+
+    expected = (0.9 + 0.7 + 0.5) / (0.9 + 0.7 + 0.5 + 0.8 + 0.3)
+    assert score == pytest.approx(expected)
+    assert 0.0 < score < 1.0
+
+
+def test_compute_evidence_score_viral_misinformation_against_dominates():
+    # 2 highly-credible sources against, 15 low-credibility sources for - the cap
+    # means volume can't drown out quality: against must still win.
+    evidence_against = [_evidence_item(0.95, "against"), _evidence_item(0.90, "against")]
+    evidence_for = [_evidence_item(0.20, "for") for _ in range(15)]
+
+    score = compute_evidence_score(evidence_for, evidence_against)
+
+    assert score < 0.5
+
+
+def test_compute_evidence_score_thin_coverage_is_not_the_default():
+    # Sparse, middling-credibility evidence (nothing >= 0.75) should still produce a
+    # real lean, not silently collapse to the "no evidence" 0.5 default.
+    evidence_for = [_evidence_item(0.65, "for"), _evidence_item(0.70, "for")]
+    evidence_against = [_evidence_item(0.60, "against")]
+
+    score = compute_evidence_score(evidence_for, evidence_against)
+
+    assert score != 0.5
 
 
 def test_domain_from_url_strips_www():

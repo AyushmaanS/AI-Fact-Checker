@@ -1,5 +1,3 @@
-from typing import Optional
-
 from pydantic import BaseModel
 
 from app.llm_client import MODEL_GPT4O, get_async_llm_client
@@ -7,9 +5,6 @@ from app.models.schemas import AnalystOutput, Claim, EvidenceItem, EvidencePacka
 
 NO_FOR_EVIDENCE_TEXT = "No supporting evidence found in searched sources."
 NO_AGAINST_EVIDENCE_TEXT = "No contradicting evidence found in searched sources."
-
-CREDIBLE_THRESHOLD = 0.75
-CONSENSUS_THRESHOLD = 0.9
 
 ANALYST_SYSTEM_PROMPT = (
     "You are an adversarial fact-checking analyst. Given a claim and evidence already "
@@ -41,41 +36,12 @@ def _build_evidence_block(items: list[EvidenceItem]) -> str:
     return "\n".join(f"- [{item.credibility_weight:.2f}] {item.excerpt}" for item in items)
 
 
-def _detect_fringe_vs_consensus(
-    evidence_for: list[EvidenceItem], evidence_against: list[EvidenceItem]
-) -> Optional[str]:
-    tagged = [(item, "for") for item in evidence_for] + [(item, "against") for item in evidence_against]
-    credible = [(item, stance) for item, stance in tagged if item.credibility_weight >= CREDIBLE_THRESHOLD]
-    low_cred = [(item, stance) for item, stance in tagged if item.credibility_weight < CREDIBLE_THRESHOLD]
-
-    if not credible:
-        return None
-
-    credible_for = sum(1 for _, stance in credible if stance == "for")
-    majority_stance = "for" if credible_for >= len(credible) - credible_for else "against"
-    majority_share = max(credible_for, len(credible) - credible_for) / len(credible)
-
-    if majority_share < CONSENSUS_THRESHOLD:
-        return None
-
-    minority_stance = "against" if majority_stance == "for" else "for"
-    if not any(stance == minority_stance for _, stance in low_cred):
-        return None
-
-    verdict_word = "supported" if majority_stance == "for" else "disputed"
-    return (
-        f"{majority_share:.0%} of credible sources (weight >= {CREDIBLE_THRESHOLD}) agree the "
-        f"claim is {verdict_word}, while lower-credibility sources push back against that consensus."
-    )
-
-
 async def analyze_evidence(claim: Claim, evidence: EvidencePackage) -> AnalystOutput:
     if not evidence.evidence_for and not evidence.evidence_against:
         return AnalystOutput(
             claim_id=claim.claim_id,
             for_summary=NO_FOR_EVIDENCE_TEXT,
             against_summary=NO_AGAINST_EVIDENCE_TEXT,
-            fringe_vs_consensus_note=None,
             outdated_flag=False,
         )
 
@@ -103,8 +69,5 @@ async def analyze_evidence(claim: Claim, evidence: EvidencePackage) -> AnalystOu
         claim_id=claim.claim_id,
         for_summary=for_summary,
         against_summary=against_summary,
-        fringe_vs_consensus_note=_detect_fringe_vs_consensus(
-            evidence.evidence_for, evidence.evidence_against
-        ),
         outdated_flag=parsed.outdated_flag,
     )
