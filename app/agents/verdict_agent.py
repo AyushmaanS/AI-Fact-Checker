@@ -5,16 +5,11 @@ from typing import Literal
 from pydantic import BaseModel
 
 from app.agents.evidence_ranker import EVIDENCE_CAP
+from app.citation_parsing import extract_citation_indices, split_sentences
 from app.llm_client import MODEL_GPT4O, get_async_llm_client
 from app.models.schemas import AnalystOutput, Claim, EvidenceItem, EvidencePackage, Verdict
 
 NO_SOURCES_RATIONALE = "No usable sources were found to verify or refute this claim."
-
-# Matches a whole [...] bracket that contains at least one SOURCE_N - not just
-# "[SOURCE_1]" but also a combined "[SOURCE_1, SOURCE_2, SOURCE_3]" bracket, which
-# models produce often enough that the validator needs to handle it, not just the
-# prompt discourage it.
-_CITATION_BRACKET_PATTERN = re.compile(r"\[([^\]]*SOURCE_\d+[^\]]*)\]")
 
 _ASSERTION_VERBS = {
     "is", "are", "was", "were", "has", "have", "had", "confirms", "confirmed",
@@ -42,6 +37,7 @@ _VERDICT_ANNOUNCEMENT_PATTERN = re.compile(
 
 def _is_verdict_announcement(sentence: str) -> bool:
     return bool(_VERDICT_ANNOUNCEMENT_PATTERN.search(sentence))
+
 
 VERDICT_SYSTEM_PROMPT = (
     "You are a fact-checking verdict writer. Given a claim, an adversarial analyst's "
@@ -103,11 +99,6 @@ def _format_source_list(sources: list[EvidenceItem]) -> str:
     )
 
 
-def _split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[.!?])\s+", text.strip())
-    return [p for p in parts if p]
-
-
 def _sentence_looks_factual(sentence: str) -> bool:
     if re.search(r"\d", sentence):
         return True
@@ -118,21 +109,14 @@ def _sentence_looks_factual(sentence: str) -> bool:
     return any(re.search(rf"\b{re.escape(verb)}\b", lowered) for verb in _ASSERTION_VERBS)
 
 
-def _extract_citation_indices(sentence: str) -> list[int]:
-    indices = []
-    for bracket_content in _CITATION_BRACKET_PATTERN.findall(sentence):
-        indices.extend(int(n) for n in re.findall(r"SOURCE_(\d+)", bracket_content))
-    return indices
-
-
 def _find_uncited_factual_sentences(rationale: str, num_sources: int) -> list[str]:
     problems = []
-    for sentence in _split_sentences(rationale):
+    for sentence in split_sentences(rationale):
         if _is_verdict_announcement(sentence):
             continue
         if not _sentence_looks_factual(sentence):
             continue
-        indices = _extract_citation_indices(sentence)
+        indices = extract_citation_indices(sentence)
         if not any(1 <= i <= num_sources for i in indices):
             problems.append(sentence)
     return problems
