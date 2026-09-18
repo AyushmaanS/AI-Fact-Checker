@@ -19,13 +19,13 @@ def _load_cases():
         return json.load(f)
 
 
-def test_intent_classifier_accuracy():
+async def test_intent_classifier_accuracy():
     cases = _load_cases()
     correct = 0
     misses = []
 
     for case in cases:
-        result = classify_intent(case["text"])
+        result = await classify_intent(case["text"])
         if result.label == case["expected_label"]:
             correct += 1
         else:

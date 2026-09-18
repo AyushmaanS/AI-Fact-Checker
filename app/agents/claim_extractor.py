@@ -2,7 +2,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from app.llm_client import MODEL_GPT4O, get_llm_client
+from app.llm_client import MODEL_GPT4O, get_async_llm_client
 from app.models.schemas import Claim
 
 SYSTEM_PROMPT = (
@@ -32,8 +32,8 @@ class _ClaimExtraction(BaseModel):
     claims: list[_ExtractedClaim]
 
 
-def extract_claims(text: str) -> list[Claim]:
-    completion = get_llm_client().chat.completions.parse(
+async def extract_claims(text: str) -> list[Claim]:
+    completion = await get_async_llm_client().chat.completions.parse(
         model=MODEL_GPT4O,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},

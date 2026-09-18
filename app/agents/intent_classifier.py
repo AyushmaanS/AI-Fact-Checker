@@ -1,4 +1,4 @@
-from app.llm_client import MODEL_GPT4O_MINI, get_llm_client
+from app.llm_client import MODEL_GPT4O_MINI, get_async_llm_client
 from app.models.schemas import ContentIntent
 
 SYSTEM_PROMPT = (
@@ -13,8 +13,8 @@ SYSTEM_PROMPT = (
 )
 
 
-def classify_intent(text: str) -> ContentIntent:
-    completion = get_llm_client().chat.completions.parse(
+async def classify_intent(text: str) -> ContentIntent:
+    completion = await get_async_llm_client().chat.completions.parse(
         model=MODEL_GPT4O_MINI,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},

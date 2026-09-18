@@ -59,3 +59,8 @@ class VerifyResponse(BaseModel):
     verdicts: list[Verdict]
     aggregate_label: Optional[str] = None
     processing_time_ms: int
+    # Not in the original spec's VerifyResponse - added in Sprint 10 so the
+    # non-factual-intent and zero-claim short-circuits (spec A.3/A.5) have
+    # somewhere to put their canned explanation without overloading
+    # aggregate_label, which is meant to hold a verdict label, not free text.
+    message: Optional[str] = None

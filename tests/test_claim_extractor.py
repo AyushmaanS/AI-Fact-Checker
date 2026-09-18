@@ -9,23 +9,23 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_single_claim_sentence():
-    claims = extract_claims("The Great Wall of China is over 13,000 miles long.")
+async def test_single_claim_sentence():
+    claims = await extract_claims("The Great Wall of China is over 13,000 miles long.")
     assert len(claims) == 1
     assert claims[0].text
 
 
-def test_multi_claim_paragraph():
+async def test_multi_claim_paragraph():
     text = (
         "The Eiffel Tower was completed in 1889. It was designed by Gustave "
         "Eiffel's engineering company. The tower is located in Paris, France."
     )
-    claims = extract_claims(text)
+    claims = await extract_claims(text)
     assert 2 <= len(claims) <= 4, f"expected 2-4 claims, got {len(claims)}: {claims}"
     ids = [c.claim_id for c in claims]
     assert len(ids) == len(set(ids))
 
 
-def test_zero_claim_text():
-    claims = extract_claims("Wow, what a beautiful sunset!")
+async def test_zero_claim_text():
+    claims = await extract_claims("Wow, what a beautiful sunset!")
     assert claims == []
