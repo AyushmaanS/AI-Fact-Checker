@@ -29,7 +29,8 @@ _VERDICT_ANNOUNCEMENT_PATTERN = re.compile(
     r"true|false|partially true|misleading|unverifiable|outdated|satire|"
     r"accurate|inaccurate|correct|incorrect|supported|unsupported|disputed|"
     r"unfounded|baseless|untrue|debunked|refuted|disproven|erroneous|"
-    r"unsubstantiated|substantiated|verified|confirmed|contradicted"
+    r"unsubstantiated|substantiated|verified|confirmed|contradicted|"
+    r"corroborated|corroborates|supports?|substantiates?"
     r")\b",
     re.IGNORECASE,
 )

@@ -1,0 +1,30 @@
+[
+  {"text": "The Eiffel Tower was completed in 1889.", "expected_label": "TRUE"},
+  {"text": "Mount Everest is the tallest mountain above sea level on Earth.", "expected_label": "TRUE"},
+  {"text": "Water boils at 100 degrees Celsius at sea level atmospheric pressure.", "expected_label": "TRUE"},
+  {"text": "The Great Wall of China is over 13,000 miles long.", "expected_label": "TRUE"},
+  {"text": "The human heart has four chambers.", "expected_label": "TRUE"},
+  {"text": "The Pacific Ocean is the largest ocean on Earth by surface area.", "expected_label": "TRUE"},
+
+  {"text": "The Eiffel Tower is located in London, England.", "expected_label": "FALSE"},
+  {"text": "The Great Wall of China is visible from the Moon with the naked eye.", "expected_label": "FALSE"},
+  {"text": "Sharks are mammals.", "expected_label": "FALSE"},
+  {"text": "The Sun revolves around the Earth.", "expected_label": "FALSE"},
+  {"text": "Napoleon Bonaparte was extremely short for his era, standing under 5 feet tall.", "expected_label": "FALSE"},
+  {"text": "Antarctica is the smallest continent by land area.", "expected_label": "FALSE"},
+
+  {"text": "The Great Wall of China is the only man-made structure visible from space, and it is over 13,000 miles long.", "expected_label": "PARTIALLY_TRUE"},
+  {"text": "The Statue of Liberty was a gift from the French government to the United States government to celebrate American independence.", "expected_label": "PARTIALLY_TRUE"},
+
+  {"text": "The Great Wall of China was built entirely during the Ming Dynasty.", "expected_label": "MISLEADING"},
+  {"text": "Bats are completely blind.", "expected_label": "MISLEADING"},
+
+  {"text": "A private letter written by Vincent van Gogh in 1881, never publicly released, mentions his fear of the color yellow.", "expected_label": "UNVERIFIABLE"},
+  {"text": "There is intelligent life on other planets somewhere in the universe.", "expected_label": "UNVERIFIABLE"},
+
+  {"text": "Pluto is the ninth planet in our solar system.", "expected_label": "OUTDATED"},
+  {"text": "The Sears Tower is the tallest building in the United States.", "expected_label": "OUTDATED"},
+  {"text": "MySpace is the most popular social networking website in the world.", "expected_label": "OUTDATED"},
+
+  {"text": "Local man discovers his houseplant has been secretly running a small hedge fund.", "expected_label": "SATIRE"}
+]
