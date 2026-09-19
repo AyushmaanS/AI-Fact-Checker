@@ -8,9 +8,13 @@ from app.agents.research_agent import research_claim
 from app.agents.verdict_agent import (
     NO_SOURCES_RATIONALE,
     VerdictCitationError,
+    _SentenceClassification,
+    _SentenceClassificationBatch,
     _VerdictLLMOutput,
     _find_uncited_factual_sentences,
     _sentence_looks_factual,
+    _stage1_heuristic_flag,
+    _stage2_semantic_filter,
     produce_verdict,
 )
 from app.config import FASTROUTER_API_KEY, SUPABASE_KEY, SUPABASE_URL, TAVILY_API_KEY
@@ -19,6 +23,10 @@ from app.models.schemas import AnalystOutput, Claim, EvidenceItem, EvidencePacka
 LIVE_SKIP = pytest.mark.skipif(
     not (TAVILY_API_KEY and FASTROUTER_API_KEY and SUPABASE_URL and SUPABASE_KEY),
     reason="TAVILY_API_KEY / FASTROUTER_API_KEY / SUPABASE_URL / SUPABASE_KEY not set in .env",
+)
+
+FASTROUTER_SKIP = pytest.mark.skipif(
+    not FASTROUTER_API_KEY, reason="FASTROUTER_API_KEY not set in .env"
 )
 
 
@@ -70,36 +78,92 @@ def test_sentence_not_factual_for_generic_filler():
     assert not _sentence_looks_factual("Overall this seems fine.")
 
 
-def test_find_uncited_factual_sentences_flags_missing_citation():
-    problems = _find_uncited_factual_sentences(
-        "It happened in 1889. This is well documented.", num_sources=2
-    )
+# --- Stage 1: cheap deterministic heuristic (unchanged behavior, no LLM call) ---
+
+
+def test_stage1_flags_missing_citation():
+    problems = _stage1_heuristic_flag("It happened in 1889. This is well documented.", num_sources=2)
     assert len(problems) == 2
 
 
-def test_find_uncited_factual_sentences_accepts_valid_citation():
-    problems = _find_uncited_factual_sentences("It happened in 1889 [SOURCE_1].", num_sources=2)
+def test_stage1_accepts_valid_citation():
+    problems = _stage1_heuristic_flag("It happened in 1889 [SOURCE_1].", num_sources=2)
     assert problems == []
 
 
-def test_find_uncited_factual_sentences_rejects_out_of_range_citation():
-    problems = _find_uncited_factual_sentences("It happened in 1889 [SOURCE_5].", num_sources=2)
+def test_stage1_rejects_out_of_range_citation():
+    problems = _stage1_heuristic_flag("It happened in 1889 [SOURCE_5].", num_sources=2)
     assert len(problems) == 1
 
 
-def test_find_uncited_factual_sentences_accepts_combined_bracket_citation():
-    problems = _find_uncited_factual_sentences(
+def test_stage1_accepts_combined_bracket_citation():
+    problems = _stage1_heuristic_flag(
         "It happened in 1889 [SOURCE_1, SOURCE_2, SOURCE_3].", num_sources=3
     )
     assert problems == []
 
 
-def test_verdict_announcement_sentence_is_exempt_from_citation_requirement():
-    problems = _find_uncited_factual_sentences(
-        "The claim that the sky is green is definitively false based on the evidence.",
-        num_sources=2,
+# --- Stage 2: semantic filter wiring (mocked LLM, tests the code not the model) ---
+
+
+@patch("app.agents.verdict_agent.get_async_llm_client")
+async def test_stage2_drops_sentences_classified_as_not_new_fact(mock_get_client):
+    parsed = _SentenceClassificationBatch(
+        items=[
+            _SentenceClassification(index=0, is_new_fact=False),
+            _SentenceClassification(index=1, is_new_fact=True),
+        ]
     )
-    assert problems == []
+    completion = MagicMock()
+    completion.choices = [MagicMock(message=MagicMock(parsed=parsed))]
+    mock_client = MagicMock()
+    mock_client.chat.completions.parse = AsyncMock(return_value=completion)
+    mock_get_client.return_value = mock_client
+
+    result = await _stage2_semantic_filter(["Evaluative restatement.", "New fact sentence."])
+
+    assert result == ["New fact sentence."]
+
+
+@patch("app.agents.verdict_agent.get_async_llm_client")
+async def test_stage2_defaults_missing_index_to_still_flagged(mock_get_client):
+    # Model didn't return a classification for index 0 - must default to keeping
+    # it flagged (stricter enforcement wins over silently dropping something
+    # uncertain), same conservative bias used elsewhere in this pipeline.
+    parsed = _SentenceClassificationBatch(items=[])
+    completion = MagicMock()
+    completion.choices = [MagicMock(message=MagicMock(parsed=parsed))]
+    mock_client = MagicMock()
+    mock_client.chat.completions.parse = AsyncMock(return_value=completion)
+    mock_get_client.return_value = mock_client
+
+    result = await _stage2_semantic_filter(["Uncertain sentence."])
+
+    assert result == ["Uncertain sentence."]
+
+
+# --- the two required regression cases, against the real model (this is the whole
+# point: proving Stage 2 actually makes the right call, not that a mock does) ---
+
+
+@FASTROUTER_SKIP
+async def test_regression_a_restated_fact_is_not_flagged():
+    rationale = (
+        'The Eiffel Tower was completed in 1889 [SOURCE_1]. '
+        'The claim that "The Eiffel Tower was completed in 1889" is corroborated by '
+        "clear and reliable evidence."
+    )
+    result = await _find_uncited_factual_sentences(rationale, num_sources=1)
+    assert result == []
+
+
+@FASTROUTER_SKIP
+async def test_regression_b_new_uncited_fact_is_still_flagged():
+    # Guards against Stage 2 becoming too permissive: this sentence has no
+    # "the claim is..."-style framing at all, just a bare new number.
+    rationale = "The tower stands 330 meters tall."
+    result = await _find_uncited_factual_sentences(rationale, num_sources=1)
+    assert result == ["The tower stands 330 meters tall."]
 
 
 # --- deterministic no-sources short circuit ---
@@ -120,10 +184,19 @@ async def test_no_sources_short_circuits_to_unverifiable():
 
 
 # --- re-prompt path (the other core Sprint 8 requirement) ---
+#
+# Stage 2 now shares the same get_async_llm_client() mock as the verdict-writing
+# call, so a plain sequential side_effect=[bad, good] list would hand Stage 2 a
+# _VerdictLLMOutput-shaped response instead of a _SentenceClassificationBatch one.
+# _stage2_semantic_filter is mocked separately as a pass-through instead, so these
+# tests exercise the retry MECHANICS (unchanged) without depending on Stage 2.
 
 
+@patch("app.agents.verdict_agent._stage2_semantic_filter", new_callable=AsyncMock)
 @patch("app.agents.verdict_agent.get_async_llm_client")
-async def test_reprompt_triggers_and_fixes_missing_citation(mock_get_client):
+async def test_reprompt_triggers_and_fixes_missing_citation(mock_get_client, mock_stage2):
+    mock_stage2.side_effect = lambda sentences: sentences  # pass-through: nothing exempted
+
     bad = _mock_completion("TRUE", "The tower was completed in 1889. This is well documented.", 0.9)
     good = _mock_completion(
         "TRUE", "The tower was completed in 1889 [SOURCE_1]. This is well documented [SOURCE_1].", 0.9
@@ -148,8 +221,11 @@ async def test_reprompt_triggers_and_fixes_missing_citation(mock_get_client):
     assert verdict.citations == ["https://example.com/a"]
 
 
+@patch("app.agents.verdict_agent._stage2_semantic_filter", new_callable=AsyncMock)
 @patch("app.agents.verdict_agent.get_async_llm_client")
-async def test_raises_if_still_uncited_after_retry(mock_get_client):
+async def test_raises_if_still_uncited_after_retry(mock_get_client, mock_stage2):
+    mock_stage2.side_effect = lambda sentences: sentences  # pass-through: nothing exempted
+
     bad = _mock_completion("TRUE", "It happened in 1889.", 0.9)
     mock_client = MagicMock()
     mock_client.chat.completions.parse = AsyncMock(side_effect=[bad, bad])

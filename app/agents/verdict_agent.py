@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from app.agents.evidence_ranker import EVIDENCE_CAP
 from app.citation_parsing import extract_citation_indices, split_sentences
-from app.llm_client import MODEL_GPT4O, get_async_llm_client
+from app.llm_client import MODEL_GPT4O, MODEL_GPT4O_MINI, get_async_llm_client
 from app.models.schemas import AnalystOutput, Claim, EvidenceItem, EvidencePackage, Verdict
 
 NO_SOURCES_RATIONALE = "No usable sources were found to verify or refute this claim."
@@ -17,28 +17,6 @@ _ASSERTION_VERBS = {
     "indicates", "indicated", "according", "occurred", "began", "completed",
     "announced", "declared", "revealed",
 }
-
-# Live testing (Sprint 8) found the model reliably writes a bare, uncited
-# verdict-announcement sentence - "The claim that X is [false/misleading/...]
-# based on the evidence" - no matter how explicitly the prompt says every
-# sentence needs a citation. Two rounds of stronger prompt wording didn't fix
-# it, so this exempts that specific pattern instead of chasing it with prompts:
-# it's restating the verdict itself, not introducing a fact of its own.
-_VERDICT_ANNOUNCEMENT_PATTERN = re.compile(
-    r"\bthe claim\b.{0,150}\b("
-    r"true|false|partially true|misleading|unverifiable|outdated|satire|"
-    r"accurate|inaccurate|correct|incorrect|supported|unsupported|disputed|"
-    r"unfounded|baseless|untrue|debunked|refuted|disproven|erroneous|"
-    r"unsubstantiated|substantiated|verified|confirmed|contradicted|"
-    r"corroborated|corroborates|supports?|substantiates?"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def _is_verdict_announcement(sentence: str) -> bool:
-    return bool(_VERDICT_ANNOUNCEMENT_PATTERN.search(sentence))
-
 
 VERDICT_SYSTEM_PROMPT = (
     "You are a fact-checking verdict writer. Given a claim, an adversarial analyst's "
@@ -66,6 +44,27 @@ VERDICT_SYSTEM_PROMPT = (
     "the evidence balance you were shown."
 )
 
+# Stage 2 exists because a keyword-only check can't tell "this introduces a new,
+# uncited fact" from "this restates a fact that was already cited a sentence ago."
+# A hardcoded list of exempt phrases ("the claim is true/false...") was tried first
+# (Sprints 8/9/11) and kept missing new phrasings the model would use instead
+# ("is corroborated by", "the evidence supports this", "refuting the claim") - an
+# unbounded list of ways to say the same thing. This asks a model to judge the
+# actual distinction instead of pattern-matching for it.
+STAGE2_SYSTEM_PROMPT = (
+    "You classify sentences pulled from a fact-check verdict's rationale. Each "
+    "sentence below was flagged because it looks like it states a fact but has no "
+    "source citation attached. For EACH numbered sentence, decide: does it assert "
+    "a NEW, independently fact-checkable detail - a specific name, date, number, "
+    "quote, or event - that a reader would need its own source for? Or is it "
+    "evaluative/summary language about the evidence itself (e.g. restating the "
+    "verdict, saying the evidence 'confirms', 'supports', or 'corroborates' "
+    "something already established elsewhere, describing how strong or consistent "
+    "the evidence is) that doesn't introduce any new checkable detail? Mark "
+    "is_new_fact=true only for the former - sentences that genuinely need their "
+    "own citation."
+)
+
 
 class _VerdictLLMOutput(BaseModel):
     label: Literal[
@@ -73,6 +72,15 @@ class _VerdictLLMOutput(BaseModel):
     ]
     rationale: str
     confidence_score: float
+
+
+class _SentenceClassification(BaseModel):
+    index: int
+    is_new_fact: bool
+
+
+class _SentenceClassificationBatch(BaseModel):
+    items: list[_SentenceClassification]
 
 
 class VerdictCitationError(RuntimeError):
@@ -110,17 +118,47 @@ def _sentence_looks_factual(sentence: str) -> bool:
     return any(re.search(rf"\b{re.escape(verb)}\b", lowered) for verb in _ASSERTION_VERBS)
 
 
-def _find_uncited_factual_sentences(rationale: str, num_sources: int) -> list[str]:
+def _stage1_heuristic_flag(rationale: str, num_sources: int) -> list[str]:
+    """Cheap, deterministic pass: sentences that look factual (a number, a proper
+    noun, or an assertion verb) and have no valid [SOURCE_N] tag. Unchanged from
+    the original single-stage validator - still has false positives (a restated
+    fact "looks" just as factual as a new one), which is exactly what Stage 2 is
+    for."""
     problems = []
     for sentence in split_sentences(rationale):
-        if _is_verdict_announcement(sentence):
-            continue
         if not _sentence_looks_factual(sentence):
             continue
         indices = extract_citation_indices(sentence)
         if not any(1 <= i <= num_sources for i in indices):
             problems.append(sentence)
     return problems
+
+
+async def _stage2_semantic_filter(sentences: list[str]) -> list[str]:
+    """Batches every Stage-1-flagged sentence into one gpt-4o-mini call and keeps
+    only the ones that actually assert a new, uncited fact."""
+    numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(sentences))
+    completion = await get_async_llm_client().chat.completions.parse(
+        model=MODEL_GPT4O_MINI,
+        messages=[
+            {"role": "system", "content": STAGE2_SYSTEM_PROMPT},
+            {"role": "user", "content": numbered},
+        ],
+        response_format=_SentenceClassificationBatch,
+    )
+    classification = {
+        item.index: item.is_new_fact for item in completion.choices[0].message.parsed.items
+    }
+    # A sentence the model didn't return a classification for defaults to "still
+    # flagged" - stricter citation enforcement wins over silently dropping it.
+    return [s for i, s in enumerate(sentences) if classification.get(i, True)]
+
+
+async def _find_uncited_factual_sentences(rationale: str, num_sources: int) -> list[str]:
+    stage1_flagged = _stage1_heuristic_flag(rationale, num_sources)
+    if not stage1_flagged:
+        return []
+    return await _stage2_semantic_filter(stage1_flagged)
 
 
 def _build_user_content(
@@ -160,19 +198,19 @@ async def produce_verdict(claim: Claim, analyst: AnalystOutput, evidence: Eviden
         model=MODEL_GPT4O, messages=messages, response_format=_VerdictLLMOutput
     )
     parsed = completion.choices[0].message.parsed
-    missing = _find_uncited_factual_sentences(parsed.rationale, len(sources))
+    missing = await _find_uncited_factual_sentences(parsed.rationale, len(sources))
 
     if missing:
+        # Everything in `missing` has already survived Stage 2's semantic filter,
+        # so - unlike the old single-stage message - this doesn't need to hedge
+        # with "if this is just a restatement": every item here genuinely needs
+        # its own citation.
         correction = (
             "Your rationale had factual statement(s) with no valid [SOURCE_N] citation:\n"
             + "\n".join(f'- "{s}"' for s in missing)
-            + "\n\nThis includes concluding or verdict-announcing sentences - if one of the "
-            "sentences above restates what the evidence shows rather than introducing a new "
-            "fact, fix it by appending the same [SOURCE_N] you already used earlier for that "
-            "fact, not by inventing a new source. Rewrite the ENTIRE rationale so every "
-            f"factual sentence cites a source between [SOURCE_1] and [SOURCE_{len(sources)}], "
-            "cited individually (e.g. [SOURCE_1] [SOURCE_2], never combined in one bracket). "
-            "Do not invent new sources."
+            + "\n\nRewrite the ENTIRE rationale so every one of these facts cites a source "
+            f"between [SOURCE_1] and [SOURCE_{len(sources)}], cited individually (e.g. "
+            "[SOURCE_1] [SOURCE_2], never combined in one bracket). Do not invent new sources."
         )
         messages.append({"role": "assistant", "content": parsed.rationale})
         messages.append({"role": "user", "content": correction})
@@ -181,7 +219,7 @@ async def produce_verdict(claim: Claim, analyst: AnalystOutput, evidence: Eviden
             model=MODEL_GPT4O, messages=messages, response_format=_VerdictLLMOutput
         )
         parsed = completion.choices[0].message.parsed
-        missing = _find_uncited_factual_sentences(parsed.rationale, len(sources))
+        missing = await _find_uncited_factual_sentences(parsed.rationale, len(sources))
 
         if missing:
             raise VerdictCitationError(
