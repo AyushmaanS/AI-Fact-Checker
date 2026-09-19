@@ -31,6 +31,12 @@ def compute_aggregate_label(verdicts: list[Verdict]) -> Optional[str]:
     return max(labels, key=_SEVERITY_ORDER.index)
 
 
+def join_rationale_segments(verdict: Verdict) -> str:
+    """Joins a Verdict's rationale_segments into one plain-text paragraph, in
+    order - for the DM/web response, and for DB storage (see routes/verify.py)."""
+    return " ".join(segment.text for segment in verdict.rationale_segments)
+
+
 def format_response(
     submission_id: str,
     claims: list[Claim],

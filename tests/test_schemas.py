@@ -1,9 +1,13 @@
 from datetime import datetime, timezone
 
+import pytest
+from pydantic import ValidationError
+
 from app.models.schemas import (
     Claim,
     EvidenceItem,
     EvidencePackage,
+    RationaleSegment,
     Verdict,
 )
 
@@ -32,12 +36,46 @@ def test_verdict_accepts_all_seven_labels():
         verdict = Verdict(
             claim_id="c1",
             label=label,
-            rationale="Confirmed by [SOURCE_1].",
+            rationale_segments=[
+                RationaleSegment(
+                    text="Confirmed by the source.",
+                    segment_type="sourced_fact",
+                    citation="https://example.com",
+                )
+            ],
             confidence_score=0.9,
             citations=["https://example.com"],
             created_at=datetime.now(timezone.utc),
         )
         assert verdict.label == label
+
+
+def test_verdict_rejects_sourced_fact_without_citation():
+    with pytest.raises(ValidationError):
+        Verdict(
+            claim_id="c1",
+            label="TRUE",
+            rationale_segments=[
+                RationaleSegment(text="A fact with no source.", segment_type="sourced_fact", citation=None)
+            ],
+            confidence_score=0.9,
+            citations=["https://example.com"],
+            created_at=datetime.now(timezone.utc),
+        )
+
+
+def test_verdict_accepts_connective_segment_without_citation():
+    verdict = Verdict(
+        claim_id="c1",
+        label="TRUE",
+        rationale_segments=[
+            RationaleSegment(text="This confirms the claim.", segment_type="connective_reasoning")
+        ],
+        confidence_score=0.9,
+        citations=[],
+        created_at=datetime.now(timezone.utc),
+    )
+    assert verdict.rationale_segments[0].citation is None
 
 
 def test_evidence_package_shape():

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 class ContentIntent(BaseModel):
@@ -44,13 +44,34 @@ class AnalystOutput(BaseModel):
     outdated_flag: bool = False
 
 
+class RationaleSegment(BaseModel):
+    text: str
+    # sourced_fact: a specific, checkable detail - needs `citation`.
+    # connective_reasoning: reasons over already-cited facts - must not have one.
+    segment_type: Literal["sourced_fact", "connective_reasoning"]
+    citation: Optional[str] = None
+
+
 class Verdict(BaseModel):
     claim_id: str
     label: Literal["TRUE", "FALSE", "PARTIALLY_TRUE", "MISLEADING", "UNVERIFIABLE", "OUTDATED", "SATIRE"]
-    rationale: str
+    rationale_segments: list[RationaleSegment]
     confidence_score: float
-    citations: list[str]  # every factual sentence in `rationale` must map to one of these
+    citations: list[str]  # every sourced_fact segment's citation must be one of these
     created_at: datetime
+
+    @model_validator(mode="after")
+    def _sourced_facts_have_valid_citations(self) -> "Verdict":
+        for segment in self.rationale_segments:
+            if segment.segment_type != "sourced_fact":
+                continue
+            if not segment.citation:
+                raise ValueError(f"sourced_fact segment has no citation: {segment.text!r}")
+            if segment.citation not in self.citations:
+                raise ValueError(
+                    f"sourced_fact segment cites {segment.citation!r}, not in citations: {segment.text!r}"
+                )
+        return self
 
 
 class VerifyResponse(BaseModel):

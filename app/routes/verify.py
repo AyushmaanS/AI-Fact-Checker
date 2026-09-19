@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from app.agents.claim_extractor import extract_claims
 from app.agents.intent_classifier import classify_intent
-from app.agents.response_formatter import format_response
+from app.agents.response_formatter import format_response, join_rationale_segments
 from app.db.client import insert_claim, insert_submission, insert_verdict
 from app.models.schemas import VerifyResponse
 from app.pipeline import process_claims
@@ -85,7 +85,7 @@ async def verify(request: VerifyRequest) -> VerifyResponse:
                 insert_verdict,
                 claim_id=db_claim_id_by_pipeline_id[verdict.claim_id],
                 label=verdict.label,
-                rationale=verdict.rationale,
+                rationale=join_rationale_segments(verdict),
                 confidence_score=verdict.confidence_score,
                 citations=verdict.citations,
             )

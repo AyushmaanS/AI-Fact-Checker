@@ -1,28 +1,36 @@
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from app.agents.citation_verifier import _CitationJudgment, verify_citations
 from app.config import FASTROUTER_API_KEY
-from app.models.schemas import Verdict
+from app.models.schemas import RationaleSegment, Verdict
 
 LIVE_SKIP = pytest.mark.skipif(not FASTROUTER_API_KEY, reason="FASTROUTER_API_KEY not set in .env")
 
 
-def _verdict(rationale: str, citations: list[str], confidence: float = 0.9) -> Verdict:
+def _verdict(segments: list[RationaleSegment], citations: list[str], confidence: float = 0.9) -> Verdict:
     return Verdict(
         claim_id="c1",
         label="TRUE",
-        rationale=rationale,
+        rationale_segments=segments,
         confidence_score=confidence,
         citations=citations,
         created_at=datetime.now(timezone.utc),
     )
 
 
-async def test_no_citations_short_circuits():
-    verdict = _verdict("No sources were found.", citations=[])
+def _sourced_fact(text: str, citation: str) -> RationaleSegment:
+    return RationaleSegment(text=text, segment_type="sourced_fact", citation=citation)
+
+
+def _connective(text: str) -> RationaleSegment:
+    return RationaleSegment(text=text, segment_type="connective_reasoning")
+
+
+async def test_no_sourced_fact_segments_short_circuits():
+    verdict = _verdict([_connective("No sources were found.")], citations=[])
     with patch("app.agents.citation_verifier._fetch_page_text") as mock_fetch:
         result = await verify_citations(verdict)
         mock_fetch.assert_not_called()
@@ -31,9 +39,9 @@ async def test_no_citations_short_circuits():
 
 async def test_unreferenced_citation_is_never_fetched_or_touched():
     # citations[] can include sources the Verdict Agent was offered but never
-    # actually cited in the text - nothing to verify those against.
+    # actually cited by any sourced_fact segment - nothing to verify those against.
     verdict = _verdict(
-        "Fact one [SOURCE_1].",
+        [_sourced_fact("Fact one.", "https://example.com/a")],
         citations=["https://example.com/a", "https://example.com/b"],
     )
     with patch("app.agents.citation_verifier._fetch_page_text") as mock_fetch, patch(
@@ -43,7 +51,7 @@ async def test_unreferenced_citation_is_never_fetched_or_touched():
         mock_judge.return_value = _CitationJudgment(supported=True, reason="ok")
         result = await verify_citations(verdict)
 
-    mock_fetch.assert_called_once()  # only SOURCE_1, not the unreferenced SOURCE_2
+    mock_fetch.assert_called_once()  # only the cited "a", not the unreferenced "b"
     assert result.citations == ["https://example.com/a", "https://example.com/b"]
 
 
@@ -57,7 +65,10 @@ async def test_mismatched_citation_is_removed_and_confidence_reduced(mock_fetch,
     ]
 
     verdict = _verdict(
-        "Real fact [SOURCE_1]. Fabricated fact [SOURCE_2].",
+        [
+            _sourced_fact("Real fact.", "https://example.com/real"),
+            _sourced_fact("Fabricated fact.", "https://example.com/fake"),
+        ],
         citations=["https://example.com/real", "https://example.com/fake"],
         confidence=0.9,
     )
@@ -72,7 +83,11 @@ async def test_unfetchable_citation_is_kept_not_penalized():
     # A site blocking automated fetches (Wikipedia, Reuters - confirmed during
     # development) must not be treated the same as a genuinely mismatched citation -
     # "couldn't check" is not "checked and failed."
-    verdict = _verdict("Fact one [SOURCE_1].", citations=["https://example.com/blocked"], confidence=0.9)
+    verdict = _verdict(
+        [_sourced_fact("Fact one.", "https://example.com/blocked")],
+        citations=["https://example.com/blocked"],
+        confidence=0.9,
+    )
     with patch("app.agents.citation_verifier._fetch_page_text") as mock_fetch, patch(
         "app.agents.citation_verifier._judge_citation"
     ) as mock_judge:
@@ -92,15 +107,18 @@ async def test_verify_citations_live_catches_mismatched_citation():
     # changes constantly and made an earlier version of this test flaky.
     mdn_404_page = "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404"
     verdict = _verdict(
-        rationale=(
-            "A 404 Not Found status means the server could not find the requested "
-            "resource [SOURCE_1]. The Great Wall of China is over 13,000 miles long [SOURCE_2]."
-        ),
-        citations=[mdn_404_page, mdn_404_page],
+        [
+            _sourced_fact(
+                "A 404 Not Found status means the server could not find the requested resource.",
+                mdn_404_page,
+            ),
+            _sourced_fact("The Great Wall of China is over 13,000 miles long.", mdn_404_page),
+        ],
+        citations=[mdn_404_page],
         confidence=0.9,
     )
 
     result = await verify_citations(verdict)
 
-    assert result.citations == [mdn_404_page]
+    assert result.citations == []
     assert result.confidence_score == pytest.approx(0.9 * 0.85)

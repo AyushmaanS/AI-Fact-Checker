@@ -12,6 +12,17 @@ BASE_URL = "https://api.fastrouter.ai/api/v1"
 MODEL_GPT4O = "openai/gpt-4o-2024-11-20"
 MODEL_GPT4O_MINI = "openai/gpt-4o-mini-2024-07-18"
 
+# The SDK's own default read timeout is 600s (confirmed via the installed
+# client's own .timeout) - fine for arbitrarily long streamed generations, but
+# nowhere near appropriate for this product's ~90s end-to-end latency target.
+# Traced two live test runs that each took ~610-625s (not a coincidence - 600s
+# default + retry overhead) back to exactly this: an occasional FastRouter
+# stall with no client-side guardrail, so the call just waited out the SDK
+# default instead of failing fast. 60s is still generous relative to this
+# codebase's own per-agent budgets (e.g. citation verification's own 10s
+# per-fetch timeout) while bounding the worst case to something sane.
+REQUEST_TIMEOUT = 60.0
+
 _client: OpenAI | None = None
 _async_client: AsyncOpenAI | None = None
 
@@ -21,7 +32,7 @@ def get_llm_client() -> OpenAI:
     if _client is None:
         if not FASTROUTER_API_KEY:
             raise RuntimeError("FASTROUTER_API_KEY must be set in .env")
-        _client = OpenAI(base_url=BASE_URL, api_key=FASTROUTER_API_KEY)
+        _client = OpenAI(base_url=BASE_URL, api_key=FASTROUTER_API_KEY, timeout=REQUEST_TIMEOUT)
     return _client
 
 
@@ -30,5 +41,7 @@ def get_async_llm_client() -> AsyncOpenAI:
     if _async_client is None:
         if not FASTROUTER_API_KEY:
             raise RuntimeError("FASTROUTER_API_KEY must be set in .env")
-        _async_client = AsyncOpenAI(base_url=BASE_URL, api_key=FASTROUTER_API_KEY)
+        _async_client = AsyncOpenAI(
+            base_url=BASE_URL, api_key=FASTROUTER_API_KEY, timeout=REQUEST_TIMEOUT
+        )
     return _async_client

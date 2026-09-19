@@ -1,6 +1,8 @@
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from app.agents.analyst_agent import analyze_evidence
 from app.agents.evidence_ranker import rank_evidence
@@ -8,25 +10,18 @@ from app.agents.research_agent import research_claim
 from app.agents.verdict_agent import (
     NO_SOURCES_RATIONALE,
     VerdictCitationError,
-    _SentenceClassification,
-    _SentenceClassificationBatch,
+    _extract_factual_details,
     _VerdictLLMOutput,
-    _find_uncited_factual_sentences,
-    _sentence_looks_factual,
-    _stage1_heuristic_flag,
-    _stage2_semantic_filter,
+    audit_connective_segments,
+    looks_factual,
     produce_verdict,
 )
 from app.config import FASTROUTER_API_KEY, SUPABASE_KEY, SUPABASE_URL, TAVILY_API_KEY
-from app.models.schemas import AnalystOutput, Claim, EvidenceItem, EvidencePackage
+from app.models.schemas import AnalystOutput, Claim, EvidenceItem, EvidencePackage, RationaleSegment, Verdict
 
 LIVE_SKIP = pytest.mark.skipif(
     not (TAVILY_API_KEY and FASTROUTER_API_KEY and SUPABASE_URL and SUPABASE_KEY),
     reason="TAVILY_API_KEY / FASTROUTER_API_KEY / SUPABASE_URL / SUPABASE_KEY not set in .env",
-)
-
-FASTROUTER_SKIP = pytest.mark.skipif(
-    not FASTROUTER_API_KEY, reason="FASTROUTER_API_KEY not set in .env"
 )
 
 
@@ -52,118 +47,137 @@ def _evidence_item(
     )
 
 
-def _mock_completion(label: str, rationale: str, confidence_score: float) -> MagicMock:
-    parsed = _VerdictLLMOutput(label=label, rationale=rationale, confidence_score=confidence_score)
+def _mock_completion(label: str, segments: list[RationaleSegment], confidence_score: float) -> MagicMock:
+    parsed = _VerdictLLMOutput(label=label, rationale_segments=segments, confidence_score=confidence_score)
     completion = MagicMock()
     completion.choices = [MagicMock(message=MagicMock(parsed=parsed))]
     return completion
 
 
-# --- sentence heuristic unit tests ---
+# --- looks_factual: cheap heuristic used only by the connective-segment audit ---
 
 
-def test_sentence_looks_factual_detects_number():
-    assert _sentence_looks_factual("It happened in 1889.")
+def test_looks_factual_detects_number():
+    assert looks_factual("It happened in 1889.")
 
 
-def test_sentence_looks_factual_detects_named_entity():
-    assert _sentence_looks_factual("The tower is located in Paris.")
+def test_looks_factual_detects_proper_noun():
+    assert looks_factual("The tower is in Paris.")
 
 
-def test_sentence_looks_factual_detects_assertion_verb():
-    assert _sentence_looks_factual("This is confirmed by officials.")
+def test_looks_factual_false_for_generic_text():
+    assert not looks_factual("This seems reasonable overall.")
 
 
-def test_sentence_not_factual_for_generic_filler():
-    assert not _sentence_looks_factual("Overall this seems fine.")
+def test_extract_factual_details_excludes_trailing_sentence_punctuation():
+    # A real bug: [\d,]* greedily swallowed a plain sentence comma/period as if
+    # it were part of the number, so "1889" written two different ways in the
+    # same paragraph ("1889," vs "1889.") extracted as two DIFFERENT tokens.
+    assert _extract_factual_details("in March 1889, this supports") == ["1889", "March"]
+    # "This" starts the second sentence here - capitalization from sentence
+    # position, not a proper noun, so it must not be extracted as a detail.
+    assert _extract_factual_details("renovated in 2018. This confirms") == ["2018"]
 
 
-# --- Stage 1: cheap deterministic heuristic (unchanged behavior, no LLM call) ---
+def test_extract_factual_details_keeps_genuine_thousands_separator():
+    assert _extract_factual_details("is over 13,000 miles long") == ["13,000"]
 
 
-def test_stage1_flags_missing_citation():
-    problems = _stage1_heuristic_flag("It happened in 1889. This is well documented.", num_sources=2)
-    assert len(problems) == 2
+# --- audit_connective_segments ---
 
 
-def test_stage1_accepts_valid_citation():
-    problems = _stage1_heuristic_flag("It happened in 1889 [SOURCE_1].", num_sources=2)
-    assert problems == []
+def test_connective_segment_without_new_fact_passes_audit():
+    # The regression case from the previous (now-retired) two-stage validator:
+    # this doesn't even reach the substring check, since it has no number and no
+    # capitalized word past the first position - looks_factual is False for it.
+    segments = [
+        RationaleSegment(
+            text="The claim is corroborated by clear and reliable evidence.",
+            segment_type="connective_reasoning",
+        )
+    ]
+    assert audit_connective_segments(segments) == []
 
 
-def test_stage1_rejects_out_of_range_citation():
-    problems = _stage1_heuristic_flag("It happened in 1889 [SOURCE_5].", num_sources=2)
-    assert len(problems) == 1
+def test_connective_segment_with_smuggled_new_fact_trips_audit():
+    segments = [
+        RationaleSegment(
+            text="The tower is 330 meters tall.", segment_type="sourced_fact", citation="https://example.com"
+        ),
+        RationaleSegment(text="It was renovated again in 2018.", segment_type="connective_reasoning"),
+    ]
+    assert audit_connective_segments(segments) == ["It was renovated again in 2018."]
 
 
-def test_stage1_accepts_combined_bracket_citation():
-    problems = _stage1_heuristic_flag(
-        "It happened in 1889 [SOURCE_1, SOURCE_2, SOURCE_3].", num_sources=3
-    )
-    assert problems == []
+def test_connective_segment_restating_a_sourced_fact_passes_audit():
+    segments = [
+        RationaleSegment(
+            text="The Eiffel Tower was completed in 1889.",
+            segment_type="sourced_fact",
+            citation="https://example.com",
+        ),
+        RationaleSegment(text="The Eiffel Tower was completed in 1889.", segment_type="connective_reasoning"),
+    ]
+    assert audit_connective_segments(segments) == []
 
 
-# --- Stage 2: semantic filter wiring (mocked LLM, tests the code not the model) ---
+def test_connective_segment_paraphrasing_a_sourced_fact_passes_audit():
+    # Reproduces a real live failure: a closing sentence almost never repeats an
+    # earlier sentence VERBATIM, it paraphrases - "construction concluded in
+    # March 1889" vs. "completed on March 31, 1889" is the same detail (1889),
+    # different wording. Checking the detail, not the sentence, must survive this.
+    segments = [
+        RationaleSegment(
+            text="The Eiffel Tower's construction was completed on March 31, 1889.",
+            segment_type="sourced_fact",
+            citation="https://example.com",
+        ),
+        RationaleSegment(
+            text=(
+                "Since the Eiffel Tower's construction concluded in March 1889, "
+                "this supports the claim that it was completed in 1889, making the claim accurate."
+            ),
+            segment_type="connective_reasoning",
+        ),
+    ]
+    assert audit_connective_segments(segments) == []
 
 
-@patch("app.agents.verdict_agent.get_async_llm_client")
-async def test_stage2_drops_sentences_classified_as_not_new_fact(mock_get_client):
-    parsed = _SentenceClassificationBatch(
-        items=[
-            _SentenceClassification(index=0, is_new_fact=False),
-            _SentenceClassification(index=1, is_new_fact=True),
-        ]
-    )
-    completion = MagicMock()
-    completion.choices = [MagicMock(message=MagicMock(parsed=parsed))]
-    mock_client = MagicMock()
-    mock_client.chat.completions.parse = AsyncMock(return_value=completion)
-    mock_get_client.return_value = mock_client
-
-    result = await _stage2_semantic_filter(["Evaluative restatement.", "New fact sentence."])
-
-    assert result == ["New fact sentence."]
+# --- schema validation (Verdict's own model_validator, not a heuristic decision) ---
 
 
-@patch("app.agents.verdict_agent.get_async_llm_client")
-async def test_stage2_defaults_missing_index_to_still_flagged(mock_get_client):
-    # Model didn't return a classification for index 0 - must default to keeping
-    # it flagged (stricter enforcement wins over silently dropping something
-    # uncertain), same conservative bias used elsewhere in this pipeline.
-    parsed = _SentenceClassificationBatch(items=[])
-    completion = MagicMock()
-    completion.choices = [MagicMock(message=MagicMock(parsed=parsed))]
-    mock_client = MagicMock()
-    mock_client.chat.completions.parse = AsyncMock(return_value=completion)
-    mock_get_client.return_value = mock_client
-
-    result = await _stage2_semantic_filter(["Uncertain sentence."])
-
-    assert result == ["Uncertain sentence."]
-
-
-# --- the two required regression cases, against the real model (this is the whole
-# point: proving Stage 2 actually makes the right call, not that a mock does) ---
+def test_sourced_fact_without_citation_fails_schema_validation():
+    with pytest.raises(ValidationError):
+        Verdict(
+            claim_id="c1",
+            label="TRUE",
+            rationale_segments=[
+                RationaleSegment(
+                    text="The tower was built in 1889.", segment_type="sourced_fact", citation=None
+                )
+            ],
+            confidence_score=0.9,
+            citations=["https://example.com"],
+            created_at=datetime.now(timezone.utc),
+        )
 
 
-@FASTROUTER_SKIP
-async def test_regression_a_restated_fact_is_not_flagged():
-    rationale = (
-        'The Eiffel Tower was completed in 1889 [SOURCE_1]. '
-        'The claim that "The Eiffel Tower was completed in 1889" is corroborated by '
-        "clear and reliable evidence."
-    )
-    result = await _find_uncited_factual_sentences(rationale, num_sources=1)
-    assert result == []
-
-
-@FASTROUTER_SKIP
-async def test_regression_b_new_uncited_fact_is_still_flagged():
-    # Guards against Stage 2 becoming too permissive: this sentence has no
-    # "the claim is..."-style framing at all, just a bare new number.
-    rationale = "The tower stands 330 meters tall."
-    result = await _find_uncited_factual_sentences(rationale, num_sources=1)
-    assert result == ["The tower stands 330 meters tall."]
+def test_sourced_fact_with_citation_not_in_citations_fails_schema_validation():
+    with pytest.raises(ValidationError):
+        Verdict(
+            claim_id="c1",
+            label="TRUE",
+            rationale_segments=[
+                RationaleSegment(
+                    text="The tower was built in 1889.",
+                    segment_type="sourced_fact",
+                    citation="https://not-offered.example.com",
+                )
+            ],
+            confidence_score=0.9,
+            citations=["https://example.com"],
+            created_at=datetime.now(timezone.utc),
+        )
 
 
 # --- deterministic no-sources short circuit ---
@@ -178,28 +192,33 @@ async def test_no_sources_short_circuits_to_unverifiable():
         mock_get_client.assert_not_called()
 
     assert verdict.label == "UNVERIFIABLE"
-    assert verdict.rationale == NO_SOURCES_RATIONALE
+    assert verdict.rationale_segments == [
+        RationaleSegment(text=NO_SOURCES_RATIONALE, segment_type="connective_reasoning")
+    ]
     assert verdict.citations == []
     assert verdict.confidence_score == 0.0
 
 
-# --- re-prompt path (the other core Sprint 8 requirement) ---
-#
-# Stage 2 now shares the same get_async_llm_client() mock as the verdict-writing
-# call, so a plain sequential side_effect=[bad, good] list would hand Stage 2 a
-# _VerdictLLMOutput-shaped response instead of a _SentenceClassificationBatch one.
-# _stage2_semantic_filter is mocked separately as a pass-through instead, so these
-# tests exercise the retry MECHANICS (unchanged) without depending on Stage 2.
+# --- retry path: both failure modes (schema violation, audit violation) ---
 
 
-@patch("app.agents.verdict_agent._stage2_semantic_filter", new_callable=AsyncMock)
 @patch("app.agents.verdict_agent.get_async_llm_client")
-async def test_reprompt_triggers_and_fixes_missing_citation(mock_get_client, mock_stage2):
-    mock_stage2.side_effect = lambda sentences: sentences  # pass-through: nothing exempted
-
-    bad = _mock_completion("TRUE", "The tower was completed in 1889. This is well documented.", 0.9)
+async def test_reprompt_fixes_schema_violation(mock_get_client):
+    bad = _mock_completion(
+        "TRUE",
+        [RationaleSegment(text="The tower was completed in 1889.", segment_type="sourced_fact", citation=None)],
+        0.9,
+    )
     good = _mock_completion(
-        "TRUE", "The tower was completed in 1889 [SOURCE_1]. This is well documented [SOURCE_1].", 0.9
+        "TRUE",
+        [
+            RationaleSegment(
+                text="The tower was completed in 1889.",
+                segment_type="sourced_fact",
+                citation="https://example.com/a",
+            )
+        ],
+        0.9,
     )
     mock_client = MagicMock()
     mock_client.chat.completions.parse = AsyncMock(side_effect=[bad, good])
@@ -217,16 +236,60 @@ async def test_reprompt_triggers_and_fixes_missing_citation(mock_get_client, moc
 
     assert mock_client.chat.completions.parse.call_count == 2
     assert verdict.label == "TRUE"
-    assert "[SOURCE_1]" in verdict.rationale
-    assert verdict.citations == ["https://example.com/a"]
+    assert verdict.rationale_segments[0].citation == "https://example.com/a"
 
 
-@patch("app.agents.verdict_agent._stage2_semantic_filter", new_callable=AsyncMock)
 @patch("app.agents.verdict_agent.get_async_llm_client")
-async def test_raises_if_still_uncited_after_retry(mock_get_client, mock_stage2):
-    mock_stage2.side_effect = lambda sentences: sentences  # pass-through: nothing exempted
+async def test_reprompt_fixes_audit_violation(mock_get_client):
+    bad = _mock_completion(
+        "TRUE",
+        [
+            RationaleSegment(
+                text="The tower was completed in 1889.",
+                segment_type="sourced_fact",
+                citation="https://example.com/a",
+            ),
+            RationaleSegment(text="It was renovated in 2018.", segment_type="connective_reasoning"),
+        ],
+        0.9,
+    )
+    good = _mock_completion(
+        "TRUE",
+        [
+            RationaleSegment(
+                text="The tower was completed in 1889.",
+                segment_type="sourced_fact",
+                citation="https://example.com/a",
+            ),
+            RationaleSegment(text="This confirms the claim is true.", segment_type="connective_reasoning"),
+        ],
+        0.9,
+    )
+    mock_client = MagicMock()
+    mock_client.chat.completions.parse = AsyncMock(side_effect=[bad, good])
+    mock_get_client.return_value = mock_client
 
-    bad = _mock_completion("TRUE", "It happened in 1889.", 0.9)
+    evidence = EvidencePackage(
+        claim_id="c1",
+        evidence_for=[_evidence_item(0.9, "for", url="https://example.com/a")],
+        evidence_against=[],
+        sources=["https://example.com/a"],
+        confidence_raw=1.0,
+    )
+
+    verdict = await produce_verdict(_claim(), _analyst_output(), evidence)
+
+    assert mock_client.chat.completions.parse.call_count == 2
+    assert verdict.label == "TRUE"
+
+
+@patch("app.agents.verdict_agent.get_async_llm_client")
+async def test_raises_if_still_invalid_after_retry(mock_get_client):
+    bad = _mock_completion(
+        "TRUE",
+        [RationaleSegment(text="The tower was completed in 1889.", segment_type="sourced_fact", citation=None)],
+        0.9,
+    )
     mock_client = MagicMock()
     mock_client.chat.completions.parse = AsyncMock(side_effect=[bad, bad])
     mock_get_client.return_value = mock_client
@@ -261,16 +324,14 @@ async def test_full_pipeline_unverifiable_with_no_evidence():
 
 # --- live label-triggering tests ---
 #
-# Confirmed by repeated live runs during development: the citation validator's
-# retry-then-fail safety net occasionally triggers on ALL of these claims, not just
-# one - a stray uncited sentence survives the one retry the model gets. That's the
-# system correctly refusing to ship an under-cited verdict, not a bug, and the
-# retry mechanism itself already has dedicated, deterministic coverage above
-# (test_reprompt_triggers_and_fixes_missing_citation, test_raises_if_still_uncited_
-# after_retry) that doesn't depend on live model behavior. So here a raised
-# VerdictCitationError is treated as an acceptable outcome alongside a correctly
-# labeled verdict - these tests are about whether the pipeline behaves correctly
-# when it DOES succeed, not about forcing every live call to succeed.
+# The structured-segment redesign specifically targets the false-positive class
+# that made the old free-text validator occasionally trigger its safety net on
+# claims that were actually fine. Kept the tolerant pattern here regardless: it
+# hasn't been proven immune to every possible failure (e.g. a genuinely uncited
+# new fact, or a mislabeled segment type), and the retry mechanism itself already
+# has dedicated, deterministic coverage above that doesn't depend on live model
+# behavior. These tests are about whether the pipeline behaves correctly when it
+# DOES succeed, not about forcing every live call to succeed.
 
 
 async def _full_pipeline_or_none(claim_text: str):
@@ -291,7 +352,7 @@ async def test_verdict_true_for_well_supported_claim():
         return
     assert verdict.label == "TRUE"
     assert verdict.citations
-    assert "[SOURCE_" in verdict.rationale
+    assert any(s.segment_type == "sourced_fact" for s in verdict.rationale_segments)
 
 
 @LIVE_SKIP

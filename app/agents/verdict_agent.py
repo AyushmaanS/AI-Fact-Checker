@@ -1,37 +1,40 @@
 import re
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.agents.evidence_ranker import EVIDENCE_CAP
-from app.citation_parsing import extract_citation_indices, split_sentences
-from app.llm_client import MODEL_GPT4O, MODEL_GPT4O_MINI, get_async_llm_client
-from app.models.schemas import AnalystOutput, Claim, EvidenceItem, EvidencePackage, Verdict
+from app.llm_client import MODEL_GPT4O, get_async_llm_client
+from app.models.schemas import (
+    AnalystOutput,
+    Claim,
+    EvidenceItem,
+    EvidencePackage,
+    RationaleSegment,
+    Verdict,
+)
 
 NO_SOURCES_RATIONALE = "No usable sources were found to verify or refute this claim."
-
-_ASSERTION_VERBS = {
-    "is", "are", "was", "were", "has", "have", "had", "confirms", "confirmed",
-    "shows", "showed", "states", "stated", "reports", "reported", "found",
-    "indicates", "indicated", "according", "occurred", "began", "completed",
-    "announced", "declared", "revealed",
-}
 
 VERDICT_SYSTEM_PROMPT = (
     "You are a fact-checking verdict writer. Given a claim, an adversarial analyst's "
     "summary of supporting and contradicting evidence, and a numbered list of sources, "
-    "write a verdict.\n\n"
-    "CITATION RULE (mandatory): every factual statement in your rationale must be "
-    "immediately followed by a citation reference like [SOURCE_1]; you may not make "
-    "any factual assertion without one. This includes your concluding/verdict-announcement "
-    "sentence(s) - if a sentence restates what the evidence shows or announces the label "
-    "(e.g. \"the claim is false\"), it needs a citation too, even if that just means "
-    "reusing a [SOURCE_N] you already cited earlier for that fact. A sentence that is "
-    "PURE framing with no factual content at all (e.g. \"In summary:\") does not need one. "
-    "Cite sources individually, like [SOURCE_1] [SOURCE_2] - not combined in one bracket "
-    "like [SOURCE_1, SOURCE_2]. Only cite sources from the numbered list you were given - "
-    "never invent a source number.\n\n"
+    "write a verdict as a sequence of rationale segments, each one of two types:\n\n"
+    "- sourced_fact: a sentence asserting a specific, checkable detail (a date, a "
+    "number, a name, a quote, an event) that came from one of the sources. Set "
+    "`citation` to the EXACT URL of the source it came from - copy it verbatim from "
+    "the numbered list below. Never invent a URL.\n"
+    "- connective_reasoning: a sentence that reasons over, summarizes, or draws a "
+    "conclusion from facts already stated in your sourced_fact segments - including "
+    "your closing verdict statement (e.g. \"this confirms the claim is false\"). "
+    "Leave `citation` unset (null) for these. A connective_reasoning segment must "
+    "NOT introduce any new checkable detail that isn't already covered by a "
+    "sourced_fact segment - if it needs a new fact, that fact belongs in its own "
+    "sourced_fact segment instead.\n\n"
+    "Every specific, checkable detail in your rationale must appear in a sourced_fact "
+    "segment with a real citation - never fold a new fact into a connective_reasoning "
+    "segment to avoid citing it.\n\n"
     "Choose exactly one label:\n"
     "- TRUE: evidence clearly supports the claim, no credible contradiction.\n"
     "- FALSE: evidence clearly contradicts the claim.\n"
@@ -44,47 +47,19 @@ VERDICT_SYSTEM_PROMPT = (
     "the evidence balance you were shown."
 )
 
-# Stage 2 exists because a keyword-only check can't tell "this introduces a new,
-# uncited fact" from "this restates a fact that was already cited a sentence ago."
-# A hardcoded list of exempt phrases ("the claim is true/false...") was tried first
-# (Sprints 8/9/11) and kept missing new phrasings the model would use instead
-# ("is corroborated by", "the evidence supports this", "refuting the claim") - an
-# unbounded list of ways to say the same thing. This asks a model to judge the
-# actual distinction instead of pattern-matching for it.
-STAGE2_SYSTEM_PROMPT = (
-    "You classify sentences pulled from a fact-check verdict's rationale. Each "
-    "sentence below was flagged because it looks like it states a fact but has no "
-    "source citation attached. For EACH numbered sentence, decide: does it assert "
-    "a NEW, independently fact-checkable detail - a specific name, date, number, "
-    "quote, or event - that a reader would need its own source for? Or is it "
-    "evaluative/summary language about the evidence itself (e.g. restating the "
-    "verdict, saying the evidence 'confirms', 'supports', or 'corroborates' "
-    "something already established elsewhere, describing how strong or consistent "
-    "the evidence is) that doesn't introduce any new checkable detail? Mark "
-    "is_new_fact=true only for the former - sentences that genuinely need their "
-    "own citation."
-)
-
 
 class _VerdictLLMOutput(BaseModel):
     label: Literal[
         "TRUE", "FALSE", "PARTIALLY_TRUE", "MISLEADING", "UNVERIFIABLE", "OUTDATED", "SATIRE"
     ]
-    rationale: str
+    rationale_segments: list[RationaleSegment]
     confidence_score: float
 
 
-class _SentenceClassification(BaseModel):
-    index: int
-    is_new_fact: bool
-
-
-class _SentenceClassificationBatch(BaseModel):
-    items: list[_SentenceClassification]
-
-
 class VerdictCitationError(RuntimeError):
-    """Raised when the model still produces uncited factual sentences after one retry."""
+    """Raised when the model still produces an invalid or under-cited verdict
+    after one retry (schema validation failure, or a connective_reasoning
+    segment that smuggles in an uncited new fact)."""
 
 
 def _numbered_sources(evidence: EvidencePackage) -> list[EvidenceItem]:
@@ -102,63 +77,113 @@ def _numbered_sources(evidence: EvidencePackage) -> list[EvidenceItem]:
 
 def _format_source_list(sources: list[EvidenceItem]) -> str:
     return "\n".join(
-        f"[SOURCE_{i}] ({item.stance}, weight {item.credibility_weight:.2f}) "
-        f"{item.excerpt} - {item.source_url}"
+        f"{i}. ({item.stance}, weight {item.credibility_weight:.2f}) "
+        f"{item.excerpt} - URL: {item.source_url}"
         for i, item in enumerate(sources, start=1)
     )
 
 
-def _sentence_looks_factual(sentence: str) -> bool:
-    if re.search(r"\d", sentence):
-        return True
-    words = sentence.strip().split()
-    if any(w[0].isupper() for w in words[1:] if w and w[0].isalpha()):
-        return True
-    lowered = sentence.lower()
-    return any(re.search(rf"\b{re.escape(verb)}\b", lowered) for verb in _ASSERTION_VERBS)
+# A comma only counts as part of the number when followed by exactly 3 more
+# digits (a genuine thousands separator, "13,000") - not [\d,]*, which greedily
+# swallowed a plain sentence comma after a year ("1889, this..." -> wrongly
+# extracted "1889," instead of "1889", which then failed to match the same year
+# written as "1889." elsewhere - a real bug caught by live testing). Same
+# reasoning for the trailing "." - only "." followed by digits is a decimal.
+_NUMBER_PATTERN = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
 
 
-def _stage1_heuristic_flag(rationale: str, num_sources: int) -> list[str]:
-    """Cheap, deterministic pass: sentences that look factual (a number, a proper
-    noun, or an assertion verb) and have no valid [SOURCE_N] tag. Unchanged from
-    the original single-stage validator - still has false positives (a restated
-    fact "looks" just as factual as a new one), which is exactly what Stage 2 is
-    for."""
-    problems = []
-    for sentence in split_sentences(rationale):
-        if not _sentence_looks_factual(sentence):
+def _extract_factual_details(text: str) -> list[str]:
+    """The specific number/date and proper-noun tokens in a piece of text - the
+    individual checkable details a sentence is built from, not the sentence as a
+    whole. A connective sentence almost never repeats an earlier sentence
+    verbatim (it paraphrases), so checking the whole sentence for reuse fails
+    even when it's legitimately just restating an already-cited detail in new
+    words - checking the details themselves survives paraphrasing."""
+    details = list(_NUMBER_PATTERN.findall(text))
+    words = text.strip().split()
+    for i, w in enumerate(words):
+        cleaned = w.strip(".,;:!?\"'()")
+        if not (cleaned and cleaned[0].isalpha() and cleaned[0].isupper()):
             continue
-        indices = extract_citation_indices(sentence)
-        if not any(1 <= i <= num_sources for i in indices):
-            problems.append(sentence)
+        # Skip a capitalized word that merely starts a sentence (the first word
+        # overall, or the word right after a ".", "!", or "?") - not a proper
+        # noun, just normal capitalization. A segment can contain more than one
+        # sentence, so this checks each sentence start, not just word index 0.
+        starts_sentence = i == 0 or words[i - 1].rstrip("\"')").endswith((".", "!", "?"))
+        if starts_sentence:
+            continue
+        details.append(cleaned)
+    return details
+
+
+def looks_factual(text: str) -> bool:
+    """Cheap heuristic: does this string contain a number/date or a proper noun?
+    Used only to audit connective_reasoning segments for smuggled-in new facts -
+    NOT a restoration of the old Stage 1 sentence scanner, which ran over a whole
+    free-text paragraph and also checked for assertion verbs. Segment typing is
+    now self-declared by the model, so that broader scan is no longer needed;
+    this just catches a connective segment that looks like it's hiding a fact."""
+    return bool(_extract_factual_details(text))
+
+
+def audit_connective_segments(segments: list[RationaleSegment]) -> list[str]:
+    sourced_text = " ".join(s.text for s in segments if s.segment_type == "sourced_fact")
+    problems = []
+    for segment in segments:
+        if segment.segment_type != "connective_reasoning":
+            continue
+        details = _extract_factual_details(segment.text)
+        if not details:
+            continue
+        if any(detail not in sourced_text for detail in details):
+            problems.append(segment.text)
     return problems
 
 
-async def _stage2_semantic_filter(sentences: list[str]) -> list[str]:
-    """Batches every Stage-1-flagged sentence into one gpt-4o-mini call and keeps
-    only the ones that actually assert a new, uncited fact."""
-    numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(sentences))
-    completion = await get_async_llm_client().chat.completions.parse(
-        model=MODEL_GPT4O_MINI,
-        messages=[
-            {"role": "system", "content": STAGE2_SYSTEM_PROMPT},
-            {"role": "user", "content": numbered},
-        ],
-        response_format=_SentenceClassificationBatch,
+def _segments_to_text(segments: list[RationaleSegment]) -> str:
+    lines = []
+    for s in segments:
+        tag = f" [citation: {s.citation}]" if s.citation else ""
+        lines.append(f"({s.segment_type}) {s.text}{tag}")
+    return "\n".join(lines)
+
+
+def _try_build_verdict(
+    claim: Claim, parsed: _VerdictLLMOutput, citation_urls: list[str]
+) -> tuple[Optional[Verdict], Optional[ValidationError]]:
+    try:
+        verdict = Verdict(
+            claim_id=claim.claim_id,
+            label=parsed.label,
+            rationale_segments=parsed.rationale_segments,
+            confidence_score=parsed.confidence_score,
+            citations=citation_urls,
+            created_at=datetime.now(timezone.utc),
+        )
+    except ValidationError as exc:
+        return None, exc
+    return verdict, None
+
+
+def _schema_correction_message(exc: ValidationError) -> str:
+    return (
+        f"Your rationale_segments failed validation:\n{exc}\n\n"
+        "Every sourced_fact segment must have `citation` set to one of the exact "
+        "URLs from the numbered source list. Rewrite the ENTIRE set of "
+        "rationale_segments so every sourced_fact segment has a valid citation."
     )
-    classification = {
-        item.index: item.is_new_fact for item in completion.choices[0].message.parsed.items
-    }
-    # A sentence the model didn't return a classification for defaults to "still
-    # flagged" - stricter citation enforcement wins over silently dropping it.
-    return [s for i, s in enumerate(sentences) if classification.get(i, True)]
 
 
-async def _find_uncited_factual_sentences(rationale: str, num_sources: int) -> list[str]:
-    stage1_flagged = _stage1_heuristic_flag(rationale, num_sources)
-    if not stage1_flagged:
-        return []
-    return await _stage2_semantic_filter(stage1_flagged)
+def _audit_correction_message(problems: list[str]) -> str:
+    listed = "\n".join(f'- "{p}"' for p in problems)
+    return (
+        "These connective_reasoning segment(s) look like they introduce a new, "
+        f"checkable detail with no citation:\n{listed}\n\n"
+        "Rewrite the ENTIRE set of rationale_segments: either turn each one into a "
+        "sourced_fact segment with a real citation from the source list, or rephrase "
+        "it to only reason over facts already stated in your sourced_fact segments, "
+        "introducing no new checkable detail of its own."
+    )
 
 
 def _build_user_content(
@@ -182,12 +207,15 @@ async def produce_verdict(claim: Claim, analyst: AnalystOutput, evidence: Eviden
         return Verdict(
             claim_id=claim.claim_id,
             label="UNVERIFIABLE",
-            rationale=NO_SOURCES_RATIONALE,
+            rationale_segments=[
+                RationaleSegment(text=NO_SOURCES_RATIONALE, segment_type="connective_reasoning")
+            ],
             confidence_score=0.0,
             citations=[],
             created_at=datetime.now(timezone.utc),
         )
 
+    citation_urls = [item.source_url for item in sources]
     client = get_async_llm_client()
     messages = [
         {"role": "system", "content": VERDICT_SYSTEM_PROMPT},
@@ -198,39 +226,28 @@ async def produce_verdict(claim: Claim, analyst: AnalystOutput, evidence: Eviden
         model=MODEL_GPT4O, messages=messages, response_format=_VerdictLLMOutput
     )
     parsed = completion.choices[0].message.parsed
-    missing = await _find_uncited_factual_sentences(parsed.rationale, len(sources))
+    verdict, schema_error = _try_build_verdict(claim, parsed, citation_urls)
+    audit_problems = audit_connective_segments(parsed.rationale_segments) if verdict else []
 
-    if missing:
-        # Everything in `missing` has already survived Stage 2's semantic filter,
-        # so - unlike the old single-stage message - this doesn't need to hedge
-        # with "if this is just a restatement": every item here genuinely needs
-        # its own citation.
+    if schema_error or audit_problems:
         correction = (
-            "Your rationale had factual statement(s) with no valid [SOURCE_N] citation:\n"
-            + "\n".join(f'- "{s}"' for s in missing)
-            + "\n\nRewrite the ENTIRE rationale so every one of these facts cites a source "
-            f"between [SOURCE_1] and [SOURCE_{len(sources)}], cited individually (e.g. "
-            "[SOURCE_1] [SOURCE_2], never combined in one bracket). Do not invent new sources."
+            _schema_correction_message(schema_error) if schema_error
+            else _audit_correction_message(audit_problems)
         )
-        messages.append({"role": "assistant", "content": parsed.rationale})
+        messages.append({"role": "assistant", "content": _segments_to_text(parsed.rationale_segments)})
         messages.append({"role": "user", "content": correction})
 
         completion = await client.chat.completions.parse(
             model=MODEL_GPT4O, messages=messages, response_format=_VerdictLLMOutput
         )
         parsed = completion.choices[0].message.parsed
-        missing = await _find_uncited_factual_sentences(parsed.rationale, len(sources))
+        verdict, schema_error = _try_build_verdict(claim, parsed, citation_urls)
+        audit_problems = audit_connective_segments(parsed.rationale_segments) if verdict else []
 
-        if missing:
+        if schema_error or audit_problems:
             raise VerdictCitationError(
-                f"Verdict still has uncited factual sentences after one retry: {missing}"
+                f"Verdict still invalid after one retry - schema_error={schema_error!r}, "
+                f"audit_problems={audit_problems}"
             )
 
-    return Verdict(
-        claim_id=claim.claim_id,
-        label=parsed.label,
-        rationale=parsed.rationale,
-        confidence_score=parsed.confidence_score,
-        citations=[item.source_url for item in sources],
-        created_at=datetime.now(timezone.utc),
-    )
+    return verdict

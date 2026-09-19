@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.config import FASTROUTER_API_KEY, SUPABASE_KEY, SUPABASE_URL, TAVILY_API_KEY
 from app.main import app
-from app.models.schemas import Claim, ContentIntent, Verdict
+from app.models.schemas import Claim, ContentIntent, RationaleSegment, Verdict
 from app.pipeline import UNCITED_FALLBACK_RATIONALE
 
 client = TestClient(app)
@@ -82,7 +82,9 @@ def test_verdict_persisted_with_correct_db_claim_id_mapping(
     verdict = Verdict(
         claim_id="c1",
         label="TRUE",
-        rationale="Rationale [SOURCE_1].",
+        rationale_segments=[
+            RationaleSegment(text="Rationale.", segment_type="sourced_fact", citation="https://example.com")
+        ],
         confidence_score=0.9,
         citations=["https://example.com"],
         created_at=datetime.now(timezone.utc),
@@ -116,5 +118,8 @@ def test_verify_endpoint_live_end_to_end():
     }
     # Either a real cited verdict, or (rarely) the citation validator's graceful
     # fallback (Sprint 8/10) - both are correct outcomes, see pipeline.py.
-    assert verdict["citations"] or verdict["rationale"] == UNCITED_FALLBACK_RATIONALE
+    assert (
+        verdict["citations"]
+        or verdict["rationale_segments"][0]["text"] == UNCITED_FALLBACK_RATIONALE
+    )
     assert body["aggregate_label"] == verdict["label"]

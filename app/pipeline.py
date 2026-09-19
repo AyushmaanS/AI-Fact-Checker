@@ -7,7 +7,7 @@ from app.agents.citation_verifier import verify_citations
 from app.agents.evidence_ranker import rank_evidence
 from app.agents.research_agent import research_claim
 from app.agents.verdict_agent import VerdictCitationError, produce_verdict
-from app.models.schemas import Claim, EvidencePackage, Verdict
+from app.models.schemas import Claim, EvidencePackage, RationaleSegment, Verdict
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,11 @@ async def _process_one_claim(claim: Claim, semaphore: asyncio.Semaphore) -> Verd
             return Verdict(
                 claim_id=claim.claim_id,
                 label="UNVERIFIABLE",
-                rationale=UNCITED_FALLBACK_RATIONALE,
+                rationale_segments=[
+                    RationaleSegment(
+                        text=UNCITED_FALLBACK_RATIONALE, segment_type="connective_reasoning"
+                    )
+                ],
                 confidence_score=0.0,
                 citations=[],
                 created_at=datetime.now(timezone.utc),
