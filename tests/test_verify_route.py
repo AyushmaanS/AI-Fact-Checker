@@ -10,9 +10,18 @@ from fastapi.testclient import TestClient
 
 from app.agents.verdict_agent import NO_SOURCES_RATIONALE
 from app.config import FASTROUTER_API_KEY, SUPABASE_KEY, SUPABASE_URL, TAVILY_API_KEY
+from app.ingestion.media_downloader import DownloadResult
+from app.ingestion.url_resolver import ResolvedURL
 from app.main import app
 from app.models.schemas import Claim, ContentIntent, EvidenceLine, Verdict
-from app.routes.verify import UPLOAD_PLACEHOLDER_MESSAGE, _build_upload_content, _save_upload_to_temp
+from app.routes.verify import (
+    UPLOAD_PLACEHOLDER_MESSAGE,
+    URL_CAPTION_ONLY_MESSAGE,
+    URL_DOWNLOAD_FAILED_MESSAGE,
+    URL_DOWNLOADED_MESSAGE,
+    _build_upload_content,
+    _save_upload_to_temp,
+)
 
 client = TestClient(app)
 
@@ -157,7 +166,11 @@ def test_verify_upload_endpoint_end_to_end(mock_insert_submission):
 
     _, kwargs = mock_insert_submission.call_args
     assert kwargs["raw_input"] == "Huge story! #factcheck"
-    assert kwargs["input_type"] == "video_upload"
+    # Must match the DB's real check constraint (see app/db/schema.sql):
+    # input_type in ('text', 'upload', 'url') - not a made-up value like
+    # "video_upload", which a mocked-DB test alone wouldn't have caught (and
+    # didn't, until this endpoint was checked against the real database).
+    assert kwargs["input_type"] == "upload"
 
 
 @patch("app.routes.verify.insert_submission")
@@ -168,6 +181,77 @@ def test_verify_upload_endpoint_without_caption(mock_insert_submission):
 
     assert response.status_code == 200
     assert response.json()["claims"] == []
+
+
+# --- Sprint 14: media downloader + /verify/url ---
+
+
+def test_verify_url_empty_url_returns_400():
+    response = client.post("/verify/url", json={"url": "   "})
+    assert response.status_code == 400
+
+
+@patch("app.routes.verify.insert_submission")
+@patch("app.routes.verify.download_media")
+@patch("app.routes.verify.resolve_url")
+def test_verify_url_successful_download(mock_resolve, mock_download, mock_insert_submission):
+    mock_resolve.return_value = ResolvedURL(
+        canonical_url="https://www.instagram.com/reel/abc123/", platform="instagram"
+    )
+    mock_download.return_value = DownloadResult(
+        success=True, file_path="/tmp/ingest_x/abc123.mp4", caption="A real caption"
+    )
+    mock_insert_submission.return_value = {"id": "sub-url-1"}
+
+    response = client.post(
+        "/verify/url", json={"url": "https://www.instagram.com/reel/abc123/?igsh=xyz"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["claims"] == []
+    assert body["message"] == URL_DOWNLOADED_MESSAGE
+
+    _, kwargs = mock_insert_submission.call_args
+    # The resolved canonical URL is persisted, not the raw messy input.
+    assert kwargs["raw_input"] == "https://www.instagram.com/reel/abc123/"
+    # Must match the DB's real check constraint - see the same note on
+    # test_verify_upload_endpoint_end_to_end.
+    assert kwargs["input_type"] == "url"
+
+
+@patch("app.routes.verify.insert_submission")
+@patch("app.routes.verify.download_media")
+@patch("app.routes.verify.resolve_url")
+def test_verify_url_caption_only_fallback(mock_resolve, mock_download, mock_insert_submission):
+    mock_resolve.return_value = ResolvedURL(
+        canonical_url="https://www.instagram.com/reel/rate-limited/", platform="instagram"
+    )
+    mock_download.return_value = DownloadResult(success=False, caption="Still got this caption")
+    mock_insert_submission.return_value = {"id": "sub-url-2"}
+
+    response = client.post("/verify/url", json={"url": "https://www.instagram.com/reel/rate-limited/"})
+
+    assert response.status_code == 200
+    assert response.json()["message"] == URL_CAPTION_ONLY_MESSAGE
+
+
+@patch("app.routes.verify.insert_submission")
+@patch("app.routes.verify.download_media")
+@patch("app.routes.verify.resolve_url")
+def test_verify_url_clean_failure_when_nothing_is_reachable(mock_resolve, mock_download, mock_insert_submission):
+    mock_resolve.return_value = ResolvedURL(
+        canonical_url="https://www.instagram.com/reel/private-post/", platform="instagram"
+    )
+    mock_download.return_value = DownloadResult(success=False, caption=None, error="Could not download this content.")
+    mock_insert_submission.return_value = {"id": "sub-url-3"}
+
+    response = client.post("/verify/url", json={"url": "https://www.instagram.com/reel/private-post/"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["claims"] == []
+    assert body["message"] == URL_DOWNLOAD_FAILED_MESSAGE
 
 
 @LIVE_SKIP

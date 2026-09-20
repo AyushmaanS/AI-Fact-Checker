@@ -12,7 +12,7 @@ and those diverge.
 ## 1. What's implemented
 
 **Phase 1 (Sprints 0–11): done.** Phase 2 (Sprints 12–18, video/image ingestion):
-**started** — Sprints 12–13 done, 14–18 not started.
+**started** — Sprints 12–14 done, 15–18 not started.
 
 | Sprint | What it built |
 |---|---|
@@ -30,6 +30,7 @@ and those diverge.
 | 11 | Eval set (22 hand-written cases) + `eval/run_eval.py` |
 | 12 | `StructuredContentObject` model + `app/ingestion/url_resolver.py` (Phase 2 start) |
 | 13 | `app/ingestion/caption_path.py` + `POST /verify/upload` (ingestion only — see §9) |
+| 14 | `app/ingestion/media_downloader.py` (yt-dlp) + `POST /verify/url` (ingestion only — see §9) |
 
 Plus 4 retrofits not tied to a sprint number, each shipped after the sprint that
 introduced the thing it replaced, each verified live before landing (details in §9):
@@ -51,8 +52,17 @@ Sprint 13's own prompt).** It saves the upload to a temp file, builds a
 persists a `submissions` row, and returns a `VerifyResponse` with `claims: []`,
 `verdicts: []`, and an explanatory `message` — it does **not** run the
 `StructuredContentObject` through the Phase 1 pipeline yet. `transcript` is always
-`None` (no downloader/transcription until Sprint 14+). See §9 for how this
-compares to functional-spec §B.4's eventual full contract.
+`None` (no transcription until Sprint 15+). See §9 for how this compares to
+functional-spec §B.4's eventual full contract.
+
+**`POST /verify/url` is ingestion-only too, and deliberately doesn't build a
+`StructuredContentObject` at all.** It resolves the URL (Sprint 12), attempts a
+download (`media_downloader.download_media`), persists a `submissions` row, and
+returns one of three canned messages depending on outcome (downloaded /
+caption-only fallback / clean failure) — no `claims`/`verdicts`. Object assembly
+for a URL submission is left to Sprint 17 ("Media Router + Object Assembly"),
+which is explicitly where the spec says that job belongs; building one here would
+have been scope creep with nothing to consume it yet.
 
 ---
 
@@ -165,6 +175,22 @@ retrofit 4 except removing a now-dead try/except, see §9), `routes/verify.py`
   best-effort redirect-follow (`_follow_redirects`, graceful fallback to the
   original URL on any failure — same "can't check, not a failure" stance as
   Citation Verifier).
+- **Media Downloader (Sprint 14) never raises — a private/deleted/rate-limited
+  post is a normal outcome, not an exceptional one** (spec §B.5). Two-stage
+  attempt: full download first; on any failure, one metadata-only (no video)
+  fetch as a second chance at just the caption, since some failure modes (e.g. a
+  CDN-specific rate limit) leave a post's metadata reachable even when the video
+  itself isn't. Confirmed live against a real public Instagram Reel (from
+  `@instagram`'s own account) and a deliberately nonexistent one — see §8.
+- **`submissions.input_type` only allows `'text' | 'upload' | 'url'`** (real
+  Postgres check constraint, `app/db/schema.sql`) — not a media-type distinction.
+  Found live while building Sprint 14: both `POST /verify/upload` and the new
+  `POST /verify/url` had been passing made-up values (`"video_upload"`,
+  `"video_url"`) that violate this constraint. `/verify/upload` had shipped in
+  Sprint 13 with this bug already in it, invisible the whole time because its
+  tests mock `insert_submission` and never exercised the real constraint — only
+  caught now because Sprint 14's own live check happened to hit the real DB.
+  Both fixed to `"upload"` / `"url"`.
 
 ---
 
@@ -197,7 +223,7 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 | `POST /verify` | ✅ implemented (the only real endpoint) |
 | `GET /verdicts/{submission_id}` | ❌ **not implemented** — speced in functional-spec §A.4, deliberately out of Sprint 10's scope |
 | `POST /verify/upload` | ✅ implemented, ingestion-only (Sprint 13) — accepts a video + optional caption, saves it, returns an explanatory message instead of a real verdict; see §1 |
-| `POST /verify/url` | Phase 2, not started |
+| `POST /verify/url` | ✅ implemented, ingestion-only (Sprint 14) — resolves the URL, attempts a yt-dlp download, falls back to caption-only or a clean failure message; see §1 |
 
 ---
 
@@ -260,25 +286,41 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 
 ## 8. Test / eval status
 
-**79 tests collected** across 14 test files (`test_main`, `test_schemas`,
+**87 tests collected** across 15 test files (`test_main`, `test_schemas`,
 `test_db`, `test_intent_classifier`, `test_claim_extractor`, `test_research_agent`,
 `test_evidence_ranker`, `test_analyst_agent`, `test_verdict_agent`,
 `test_citation_verifier`, `test_verify_route`, `test_pipeline`, `test_url_resolver`,
-`test_caption_path`). The 10 `test_url_resolver` tests are Sprint 12's, and 5 more
-in `test_caption_path` plus 5 upload-endpoint tests added to `test_verify_route`
-are Sprint 13's — all 20 deterministic, no network, no live-key gating. **All
-pass**, including every live test
+`test_caption_path`, `test_media_downloader`). The 10 `test_url_resolver` tests are
+Sprint 12's; 5 in `test_caption_path` plus 5 upload-endpoint tests in
+`test_verify_route` are Sprint 13's; 4 in `test_media_downloader` plus 4
+url-endpoint tests in `test_verify_route` are Sprint 14's — all 28 deterministic,
+no network, no live-key gating (Sprint 14's real yt-dlp/Instagram/DB behavior was
+instead verified with real, ad-hoc live checks, not baked into the permanent
+suite - see the note below on why). **All pass**, including every live test
 (needs `FASTROUTER_API_KEY` / `TAVILY_API_KEY` / Supabase creds) — confirmed via
 two full consecutive runs after retrofit 4, the second one clean, plus the
-non-live subset (74 tests) confirmed clean again after Sprints 12 and 13, most
-recently 74 passed / 5 deselected. One live test's own expectation had to be
-fixed along the way, during retrofit 4: the old
+non-live subset (82 tests) confirmed clean again after Sprint 14, most recently
+82 passed / 5 deselected. One live test's own expectation had to be fixed along
+the way, during retrofit 4: the old
 "per-URL" citation removal test asserted a shared citation gets fully wiped when
 any one of its lines fails; that's no longer correct under the new fine-grained
 per-`EvidenceLine` removal (§3), so the assertion was corrected and a deterministic
 regression test for the same "shared URL, one valid line" case was added
 (`test_shared_citation_url_survives_if_one_of_its_lines_is_valid`) — not a code bug,
 a stale test expectation caught by live testing doing exactly its job.
+
+**Sprint 14's live verification was deliberately kept out of the permanent pytest
+suite**, unlike every other live test here, because it would depend on one
+specific, currently-real Instagram Reel URL staying up indefinitely - a genuine
+content-liveness risk none of the other live tests carry (they depend on stable
+facts like "the Eiffel Tower was completed in 1889," not on a specific post not
+being deleted). Verified instead via ad-hoc live runs during development: a real
+Reel from `@instagram`'s own account (found by browsing, not fabricated)
+downloaded successfully end-to-end through the actual `/verify/url` route with a
+real Supabase write (3.28MiB file, real extracted caption); a deliberately
+nonexistent reel id (`.../reel/AAAAAAAAAAA/`) failed cleanly through the same
+route with no crash. This same live check is what caught the `input_type` bug
+above.
 
 **`eval/run_eval.py` post-retrofit-4: 17/22 (77%), 63.7s total** — above the prior
 design's 64–73% range, so no regression (this single run is also each design's
@@ -369,3 +411,14 @@ full... and confirm no regressions") — retrofit 4 is now fully complete.
   non-factual-intent/zero-claim short circuits. No sprint has yet specified when
   `StructuredContentObject` actually gets handed to the Phase 1 engine (spec §B.1
   step 6 describes this as the eventual end state, not tied to a sprint number).
+- **Sprint 14:** same ingestion-only scoping as Sprint 13, for the same reason
+  (this sprint's DoD is the download mechanism itself, not fact-checking) —
+  `POST /verify/url` doesn't build a `StructuredContentObject` at all, unlike
+  Sprint 13's upload endpoint, since that job is explicitly Sprint 17's per its
+  own title ("Media Router + Object Assembly"); see §1. Also found and fixed a
+  real bug retroactively affecting Sprint 13 too: `submissions.input_type` has a
+  real Postgres check constraint (`'text' | 'upload' | 'url'` only,
+  `app/db/schema.sql`), and both upload endpoints had been passing invented
+  values (`"video_upload"`, `"video_url"`) that violate it - invisible until
+  Sprint 14's own live DB check happened to hit the real constraint, since every
+  prior test for both endpoints mocked `insert_submission`. See §3/§8.

@@ -11,6 +11,8 @@ from app.agents.intent_classifier import classify_intent
 from app.agents.response_formatter import format_response, format_verdict_text
 from app.db.client import insert_claim, insert_submission, insert_verdict
 from app.ingestion.caption_path import extract_caption_content
+from app.ingestion.media_downloader import download_media
+from app.ingestion.url_resolver import resolve_url
 from app.models.schemas import StructuredContentObject, VerifyResponse
 from app.pipeline import process_claims
 
@@ -25,13 +27,27 @@ _INTENT_CANNED_MESSAGES = {
 
 NO_CLAIMS_MESSAGE = "No verifiable claims found in the submitted text."
 
-# Sprint 14's downloader/transcription pipeline doesn't exist yet, so an upload
-# is ingested (saved + wrapped into a StructuredContentObject) but not yet run
-# through fact-checking - this says so rather than silently returning an empty
-# verdict list with no explanation.
+# Transcription/vision analysis (Sprint 15+) and object assembly (Sprint 17)
+# don't exist yet, so ingestion (an upload, or a downloaded/caption-only URL) is
+# never run through fact-checking - this says so rather than silently returning
+# an empty verdict list with no explanation.
 UPLOAD_PLACEHOLDER_MESSAGE = (
     "File received and saved. Fact-checking on uploaded video isn't wired up yet "
     "- transcription and vision analysis are a later sprint."
+)
+URL_DOWNLOADED_MESSAGE = (
+    "Video downloaded and saved. Fact-checking on downloaded video isn't wired up "
+    "yet - transcription and vision analysis are a later sprint."
+)
+URL_CAPTION_ONLY_MESSAGE = (
+    "Could not download the video (it may be private, deleted, or the platform is "
+    "rate-limiting downloads), but a caption was found and ingested. "
+    "Fact-checking on this content isn't wired up yet - transcription and vision "
+    "analysis are a later sprint."
+)
+URL_DOWNLOAD_FAILED_MESSAGE = (
+    "Could not download this content, and no caption text was available either - "
+    "the post may be private, deleted, or the platform is rate-limiting downloads."
 )
 
 
@@ -126,7 +142,7 @@ def _build_upload_content(caption: str) -> StructuredContentObject:
         caption=caption_text,
         topics=topics,
         media_type="video",
-        transcript=None,  # placeholder - no downloader/transcription until Sprint 14+
+        transcript=None,  # placeholder - no transcription until Sprint 15+
     )
 
 
@@ -134,13 +150,12 @@ def _build_upload_content(caption: str) -> StructuredContentObject:
 async def verify_upload(file: UploadFile = File(...), caption: str = Form("")) -> VerifyResponse:
     start = time.perf_counter()
 
-    # Confirms the upload is durably saved even though nothing consumes it yet -
-    # Sprint 14's downloader will read from a saved path like this one.
+    # Confirms the upload is durably saved even though nothing consumes it yet.
     await _save_upload_to_temp(file)
     content = _build_upload_content(caption)
 
     submission = await asyncio.to_thread(
-        insert_submission, raw_input=content.caption, input_type="video_upload"
+        insert_submission, raw_input=content.caption, input_type="upload"
     )
 
     return format_response(
@@ -149,4 +164,48 @@ async def verify_upload(file: UploadFile = File(...), caption: str = Form("")) -
         verdicts=[],
         processing_time_ms=_elapsed_ms(start),
         message=UPLOAD_PLACEHOLDER_MESSAGE,
+    )
+
+
+class VerifyUrlRequest(BaseModel):
+    url: str
+
+
+@router.post("/verify/url", response_model=VerifyResponse)
+async def verify_url(request: VerifyUrlRequest) -> VerifyResponse:
+    raw_url = request.url.strip()
+    if not raw_url:
+        raise HTTPException(status_code=400, detail="url must not be empty")
+
+    start = time.perf_counter()
+
+    resolved = await resolve_url(raw_url)
+    result = await download_media(resolved.canonical_url)
+
+    submission = await asyncio.to_thread(
+        insert_submission, raw_input=resolved.canonical_url, input_type="url"
+    )
+
+    if not result.success and not result.caption:
+        # spec B.5: private/deleted/broken URL -> a clean user-facing message,
+        # never a raw stack trace. Still a 200 - the request itself was handled
+        # correctly, same as the non-factual-intent/zero-claim short circuits.
+        return format_response(
+            submission_id=submission["id"],
+            claims=[],
+            verdicts=[],
+            processing_time_ms=_elapsed_ms(start),
+            message=URL_DOWNLOAD_FAILED_MESSAGE,
+        )
+
+    # Object assembly (StructuredContentObject) for a downloaded/caption-only URL
+    # is Sprint 17's explicit job ("Media Router + Object Assembly") - this
+    # sprint's DoD is the download mechanism itself: succeed, fall back to
+    # caption-only, or fail cleanly.
+    return format_response(
+        submission_id=submission["id"],
+        claims=[],
+        verdicts=[],
+        processing_time_ms=_elapsed_ms(start),
+        message=URL_DOWNLOADED_MESSAGE if result.success else URL_CAPTION_ONLY_MESSAGE,
     )
