@@ -11,6 +11,10 @@ BASE_URL = "https://api.fastrouter.ai/api/v1"
 # Outputs shipped with the 2024-08-06 snapshot) - use a later dated snapshot here.
 MODEL_GPT4O = "openai/gpt-4o-2024-11-20"
 MODEL_GPT4O_MINI = "openai/gpt-4o-mini-2024-07-18"
+# Confirmed live: FastRouter proxies OpenAI's Whisper endpoint too, same
+# client, same audio.transcriptions.create() API - no separate OPENAI_API_KEY
+# needed (real per-segment no_speech_prob included in verbose_json output).
+MODEL_WHISPER = "openai/whisper-1"
 
 # The SDK's own default read timeout is 600s (confirmed via the installed
 # client's own .timeout) - fine for arbitrarily long streamed generations, but

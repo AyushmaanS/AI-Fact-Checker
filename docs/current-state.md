@@ -12,7 +12,7 @@ and those diverge.
 ## 1. What's implemented
 
 **Phase 1 (Sprints 0–11): done.** Phase 2 (Sprints 12–18, video/image ingestion):
-**started** — Sprints 12–14 done, 15–18 not started.
+**started** — Sprints 12–15 done, 16–18 not started.
 
 | Sprint | What it built |
 |---|---|
@@ -31,6 +31,7 @@ and those diverge.
 | 12 | `StructuredContentObject` model + `app/ingestion/url_resolver.py` (Phase 2 start) |
 | 13 | `app/ingestion/caption_path.py` + `POST /verify/upload` (ingestion only — see §9) |
 | 14 | `app/ingestion/media_downloader.py` (yt-dlp) + `POST /verify/url` (ingestion only — see §9) |
+| 15 | `app/ingestion/video_path.py` audio portion (ffmpeg + Whisper transcription) — standalone, not wired in yet (see §9) |
 
 Plus 4 retrofits not tied to a sprint number, each shipped after the sprint that
 introduced the thing it replaced, each verified live before landing (details in §9):
@@ -191,6 +192,31 @@ retrofit 4 except removing a now-dead try/except, see §9), `routes/verify.py`
   tests mock `insert_submission` and never exercised the real constraint — only
   caught now because Sprint 14's own live check happened to hit the real DB.
   Both fixed to `"upload"` / `"url"`.
+- **`ffmpeg` isn't installed system-wide — `imageio-ffmpeg` (a pip package
+  bundling a portable static binary) is used instead**, deliberately, over a
+  system-level install (`winget` is available and would have worked, but a
+  system-wide install reaches outside this project the way none of its other
+  dependencies do - `imageio_ffmpeg.get_ffmpeg_exe()` keeps ffmpeg fully
+  contained in the venv like everything else). Confirmed working live
+  (ffmpeg 7.1) before writing any code against it.
+- **FastRouter proxies Whisper too, not just chat models** — confirmed live
+  (`openai/whisper-1`, real `audio.transcriptions.create()` call, real
+  `verbose_json` response with per-segment `no_speech_prob`/`avg_logprob`).
+  This settles a question this doc used to carry as open: `OPENAI_API_KEY` is
+  **not** needed for transcription after all - see §6.
+- **Transcript confidence uses `no_speech_prob` OR `avg_logprob` together, not
+  `no_speech_prob` alone** (`video_path._is_low_confidence`) - flags on ANY
+  segment tripping either signal, not an average across segments. Found live,
+  the hard way: a pure 440Hz tone (standing in for "music, no speech") got
+  hallucinated by Whisper into real-looking short text - `"**BLEEP**"` one run,
+  `"[(12-Bell Sounds)]"` and `"the"` on others - each time with
+  `no_speech_prob` around 0.44, *under* a naive 0.5 threshold, so a
+  no_speech_prob-only check would have called it confident speech. `avg_logprob`
+  caught it every time (-1.8ish vs. -0.3 for genuine speech, confirmed live on
+  a real transcript). One hallucinated segment among otherwise-good ones still
+  trips the flag - not averaged away - since a fabricated "fact" threaded into
+  real speech is exactly what a fact-checking product can't afford to trust
+  silently. See §8 for the live verification.
 
 ---
 
@@ -234,7 +260,7 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 | `FASTROUTER_API_KEY` | all LLM calls | active |
 | `TAVILY_API_KEY` | research_agent | active (on a third key as of 2026-09-20 — both the original and the one pre-authorized backup hit `ForbiddenError: usage limit` during this session; project owner supplied a new key to unblock the eval rerun in §8) |
 | `SUPABASE_URL` / `SUPABASE_KEY` | db/client.py | active |
-| `OPENAI_API_KEY` | — | **present in `.env.example` but unused** — no code path calls OpenAI directly; reserved for Whisper transcription once Phase 2 starts, may or may not still be needed depending on whether FastRouter proxies audio endpoints (never checked) |
+| `OPENAI_API_KEY` | — | **present in `.env.example` but unused, confirmed not needed** — FastRouter proxies Whisper too (`app/ingestion/video_path.py`, Sprint 15), same as every other model in this codebase. No code path calls OpenAI directly. |
 
 ---
 
@@ -286,21 +312,23 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 
 ## 8. Test / eval status
 
-**87 tests collected** across 15 test files (`test_main`, `test_schemas`,
+**95 tests collected** across 16 test files (`test_main`, `test_schemas`,
 `test_db`, `test_intent_classifier`, `test_claim_extractor`, `test_research_agent`,
 `test_evidence_ranker`, `test_analyst_agent`, `test_verdict_agent`,
 `test_citation_verifier`, `test_verify_route`, `test_pipeline`, `test_url_resolver`,
-`test_caption_path`, `test_media_downloader`). The 10 `test_url_resolver` tests are
-Sprint 12's; 5 in `test_caption_path` plus 5 upload-endpoint tests in
-`test_verify_route` are Sprint 13's; 4 in `test_media_downloader` plus 4
-url-endpoint tests in `test_verify_route` are Sprint 14's — all 28 deterministic,
-no network, no live-key gating (Sprint 14's real yt-dlp/Instagram/DB behavior was
-instead verified with real, ad-hoc live checks, not baked into the permanent
-suite - see the note below on why). **All pass**, including every live test
+`test_caption_path`, `test_media_downloader`, `test_video_path`). The 10
+`test_url_resolver` tests are Sprint 12's; 5 in `test_caption_path` plus 5
+upload-endpoint tests in `test_verify_route` are Sprint 13's; 4 in
+`test_media_downloader` plus 4 url-endpoint tests in `test_verify_route` are
+Sprint 14's; the 12 in `test_video_path` are Sprint 15's — all 40 deterministic,
+no network, no live-key gating (Sprints 14/15's real yt-dlp/ffmpeg/Whisper/DB
+behavior was instead verified with real, ad-hoc live checks, not baked into the
+permanent suite - see the note below on why). **All pass**, including every live test
 (needs `FASTROUTER_API_KEY` / `TAVILY_API_KEY` / Supabase creds) — confirmed via
 two full consecutive runs after retrofit 4, the second one clean, plus the
-non-live subset (82 tests) confirmed clean again after Sprint 14, most recently
-82 passed / 5 deselected. One live test's own expectation had to be fixed along
+non-live subset (90 tests) confirmed clean again after Sprint 15, most recently
+90 passed / 5 deselected (one flaky live-marked test not caught by that filter,
+see below). One live test's own expectation had to be fixed along
 the way, during retrofit 4: the old
 "per-URL" citation removal test asserted a shared citation gets fully wiped when
 any one of its lines fails; that's no longer correct under the new fine-grained
@@ -309,18 +337,32 @@ regression test for the same "shared URL, one valid line" case was added
 (`test_shared_citation_url_survives_if_one_of_its_lines_is_valid`) — not a code bug,
 a stale test expectation caught by live testing doing exactly its job.
 
-**Sprint 14's live verification was deliberately kept out of the permanent pytest
-suite**, unlike every other live test here, because it would depend on one
-specific, currently-real Instagram Reel URL staying up indefinitely - a genuine
+**A reminder for next time: `-k "not live"` only filters by test *name*, not by
+`@LIVE_SKIP`.** Running the suite this way during Sprint 15 still hit a real
+live call in `test_verdict_agent.py::test_verdict_true_for_well_supported_claim`
+(no "live" in its name) and it came back `PARTIALLY_TRUE` instead of the
+tolerated `{TRUE, UNVERIFIABLE}` — re-ran in isolation and it passed
+(`TRUE`), confirming ordinary LLM judgment variance on Phase 1's Verdict Agent,
+unrelated to Sprint 15 (which touches only `app/ingestion/video_path.py` and
+adds one unused-elsewhere constant to `llm_client.py`). Not a regression; just a
+reminder that "not live" by keyword isn't the same as "no network calls."
+
+**Sprints 14 and 15's live verification were both deliberately kept out of the
+permanent pytest suite**, unlike every other live test here, because both would
+depend on specific external state staying available indefinitely - one
+specific, currently-real Instagram Reel URL (Sprint 14) - a genuine
 content-liveness risk none of the other live tests carry (they depend on stable
 facts like "the Eiffel Tower was completed in 1889," not on a specific post not
-being deleted). Verified instead via ad-hoc live runs during development: a real
-Reel from `@instagram`'s own account (found by browsing, not fabricated)
-downloaded successfully end-to-end through the actual `/verify/url` route with a
-real Supabase write (3.28MiB file, real extracted caption); a deliberately
-nonexistent reel id (`.../reel/AAAAAAAAAAA/`) failed cleanly through the same
-route with no crash. This same live check is what caught the `input_type` bug
-above.
+being deleted). Verified instead via ad-hoc live runs during development. Sprint
+14: a real Reel from `@instagram`'s own account (found by browsing, not
+fabricated) downloaded successfully end-to-end through the actual
+`/verify/url` route with a real Supabase write (3.28MiB file, real extracted
+caption); a deliberately nonexistent reel id (`.../reel/AAAAAAAAAAA/`) failed
+cleanly through the same route with no crash. This same live check is what
+caught the `input_type` bug above. Sprint 15: a real Windows-TTS-generated
+speech clip and an ffmpeg-generated pure-tone clip, each muxed into a real
+video file and run through the actual `transcribe_video()` end to end (not
+mocked) - see §3 for what the tone clip caught.
 
 **`eval/run_eval.py` post-retrofit-4: 17/22 (77%), 63.7s total** — above the prior
 design's 64–73% range, so no regression (this single run is also each design's
@@ -422,3 +464,11 @@ full... and confirm no regressions") — retrofit 4 is now fully complete.
   values (`"video_upload"`, `"video_url"`) that violate it - invisible until
   Sprint 14's own live DB check happened to hit the real constraint, since every
   prior test for both endpoints mocked `insert_submission`. See §3/§8.
+- **Sprint 15:** `transcribe_video()` is a standalone function with no caller
+  anywhere in the codebase yet - same as Sprint 12's `resolve_url()` (§1), and
+  for the same reason: nothing has assembled a full ingestion pipeline that
+  would call it (Sprint 17's job). Also: the prompt's suggested confidence
+  heuristic ("no_speech_prob... or transcript length near zero") turned out to
+  need a real fix once tested live - see §3's write-up of the hallucinated
+  "**BLEEP**"/tone-clip finding and why `avg_logprob` had to be added alongside
+  `no_speech_prob`, not used as originally scoped.
