@@ -12,7 +12,7 @@ and those diverge.
 ## 1. What's implemented
 
 **Phase 1 (Sprints 0–11): done.** Phase 2 (Sprints 12–18, video/image ingestion):
-**started** — Sprints 12–16 done, 17–18 not started.
+**started** — Sprints 12–17 done, 18 not started.
 
 | Sprint | What it built |
 |---|---|
@@ -33,6 +33,7 @@ and those diverge.
 | 14 | `app/ingestion/media_downloader.py` (yt-dlp) + `POST /verify/url` (ingestion only — see §9) |
 | 15 | `app/ingestion/video_path.py` audio portion (ffmpeg + Whisper transcription) — standalone, not wired in yet (see §9) |
 | 16 | `app/ingestion/video_path.py` frame sampling + GPT-4o Vision (`analyze_frames`) — standalone, not wired in yet (see §9) |
+| 17 | `app/ingestion/media_router.py` (`detect_media_type` + `route_and_assemble`) — ties Sprints 13/15/16 together into one `StructuredContentObject`; standalone, not wired into a route yet (see §9) |
 
 Plus 4 retrofits not tied to a sprint number, each shipped after the sprint that
 introduced the thing it replaced, each verified live before landing (details in §9):
@@ -235,6 +236,29 @@ retrofit 4 except removing a now-dead try/except, see §9), `routes/verify.py`
   digits (an unintended discovery - ffmpeg's `testsrc` pattern draws a visible
   running counter) were also read correctly rather than something being
   invented for a plain background. See §8.
+- **There's no separate "Image Path" component anywhere in the spec, but the
+  DoD explicitly requires testing a static image** - Sprint 17's own prompt
+  only names dispatch to "Video Path or Caption Path." Bridged by adding
+  `video_path.analyze_image(image_path)`: reuses the exact same vision call
+  and combination logic `analyze_frames` uses, just skipping ffmpeg frame
+  extraction entirely and sending the one static image directly (there's only
+  ever one frame). `VISION_SYSTEM_PROMPT` was generalized slightly (no longer
+  assumes "frames from a video") so the same prompt is accurate for both
+  callers. See §9 for the full flagged deviation.
+- **A downloaded file's `media_type` is detected from its own MIME type**
+  (`mimetypes.guess_type`, via extension), not sniffed from content - a
+  downloaded file always has a real extension, so no need to open/inspect it.
+  Found live: Python's `mimetypes` module doesn't register `.webp` by default
+  on this system, despite Instagram actively serving images as WebP -
+  registered explicitly (`mimetypes.add_type`) rather than left as a silent
+  gap that would have quietly misrouted a real, common case to `text_post`.
+  An unrecognized extension still falls back to `text_post` deliberately -
+  caption-only degradation is always safe; guessing at video/image handling
+  for an unknown format is not.
+- **`transcribe_video` and `analyze_frames` run concurrently for a video**
+  (`asyncio.gather`), not sequentially - independent operations (audio vs.
+  frames) that both only read the same source file, consistent with this
+  codebase's established concurrency stance since Sprint 6.
 
 ---
 
@@ -330,25 +354,30 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 
 ## 8. Test / eval status
 
-**111 tests collected** across 16 test files (`test_main`, `test_schemas`,
+**120 tests collected** across 17 test files (`test_main`, `test_schemas`,
 `test_db`, `test_intent_classifier`, `test_claim_extractor`, `test_research_agent`,
 `test_evidence_ranker`, `test_analyst_agent`, `test_verdict_agent`,
 `test_citation_verifier`, `test_verify_route`, `test_pipeline`, `test_url_resolver`,
-`test_caption_path`, `test_media_downloader`, `test_video_path`). The 10
-`test_url_resolver` tests are Sprint 12's; 5 in `test_caption_path` plus 5
-upload-endpoint tests in `test_verify_route` are Sprint 13's; 4 in
-`test_media_downloader` plus 4 url-endpoint tests in `test_verify_route` are
-Sprint 14's; 12 in `test_video_path` are Sprint 15's and 12 more in the same
-file are Sprint 16's — all 52 deterministic, no network, no live-key gating
-(Sprints 14/15/16's real yt-dlp/ffmpeg/Whisper/Vision/DB behavior was instead
-verified with real, ad-hoc live checks, not baked into the permanent suite -
-see the note below on why). **All pass**, including every live test
-(needs `FASTROUTER_API_KEY` / `TAVILY_API_KEY` / Supabase creds) — confirmed via
+`test_caption_path`, `test_media_downloader`, `test_video_path`,
+`test_media_router`). The 10 `test_url_resolver` tests are Sprint 12's; 5 in
+`test_caption_path` plus 5 upload-endpoint tests in `test_verify_route` are
+Sprint 13's; 4 in `test_media_downloader` plus 4 url-endpoint tests in
+`test_verify_route` are Sprint 14's; 12 in `test_video_path` are Sprint 15's
+and 12 more in the same file are Sprint 16's; 9 in `test_media_router` are
+Sprint 17's, of which 8 are deterministic and 1
+(`test_schema_consistency_across_all_three_media_types`) is genuinely live -
+unlike Sprints 14-16, this one **is** baked into the permanent suite, because
+the sprint prompt explicitly asked to "write a...pytest," not just verify
+informally, and it needs no external content (generates its own video/image
+locally via ffmpeg each run, so no content-liveness risk). **All pass**,
+including every live test (needs `FASTROUTER_API_KEY` / `TAVILY_API_KEY` /
+Supabase creds) — confirmed via
 two full consecutive runs after retrofit 4, the second one clean, plus the
-non-live subset (106 tests) confirmed clean again after Sprint 16, most recently
-106 passed / 5 deselected (one flaky live-marked test not caught by that filter,
-see below). One live test's own expectation had to be fixed along
-the way, during retrofit 4: the old
+non-live subset (115 tests, which still includes the Sprint 17 live test -
+its name doesn't contain "live" either) confirmed clean again after Sprint 17,
+most recently 115 passed / 5 deselected (one flaky live-marked test not caught
+by that filter, see below). One live test's own expectation had to be fixed
+along the way, during retrofit 4: the old
 "per-URL" citation removal test asserted a shared citation gets fully wiped when
 any one of its lines fails; that's no longer correct under the new fine-grained
 per-`EvidenceLine` removal (§3), so the assertion was corrected and a deterministic
@@ -390,6 +419,20 @@ mocked) - see §3 for what the tone clip caught. Sprint 16: a real
 ffmpeg-`drawtext`-generated video with a burned-in "SALES UP 47 PERCENT"
 overlay, run through the actual `analyze_frames()` end to end - the on-screen
 text came back transcribed exactly, confirming the DoD directly.
+
+**Sprint 17 breaks that pattern on purpose** — its schema-consistency check
+(`test_schema_consistency_across_all_three_media_types`, `test_media_router.py`)
+*is* a permanent, live-gated pytest, not an ad-hoc check, because the sprint
+prompt explicitly asked to "write a...pytest," and because it carries neither
+of the two reasons the others were kept out: no external content-liveness risk
+(video/image are generated locally via ffmpeg inside the test itself, fresh
+each run) and it's proving something no other test does (the three dispatch
+paths actually converge on one consistent object shape) rather than re-proving
+logic the mocked tests already cover. Confirmed live: real burned-in overlay
+text ("TEST OVERLAY 99" in the video, "IMAGE OVERLAY 42" in the image) came
+back correctly in each object's `visual_context`, and the null/non-null
+pattern was exactly as spec'd (`transcript` real only for video;
+`visual_context` real for video and image; both null for the caption-only case).
 
 **`eval/run_eval.py` post-retrofit-4: 17/22 (77%), 63.7s total** — above the prior
 design's 64–73% range, so no regression (this single run is also each design's
@@ -494,7 +537,8 @@ full... and confirm no regressions") — retrofit 4 is now fully complete.
 - **Sprint 15:** `transcribe_video()` is a standalone function with no caller
   anywhere in the codebase yet - same as Sprint 12's `resolve_url()` (§1), and
   for the same reason: nothing has assembled a full ingestion pipeline that
-  would call it (Sprint 17's job). Also: the prompt's suggested confidence
+  would call it (turned out to be Sprint 17's job, and even Sprint 17 doesn't
+  wire it into a route - see below). Also: the prompt's suggested confidence
   heuristic ("no_speech_prob... or transcript length near zero") turned out to
   need a real fix once tested live - see §3's write-up of the hallucinated
   "**BLEEP**"/tone-clip finding and why `avg_logprob` had to be added alongside
@@ -508,3 +552,17 @@ full... and confirm no regressions") — retrofit 4 is now fully complete.
   generalizing the prompt's literal "every 3rd frame" example to scale
   sensibly for both short and long videos rather than hardcoding a fixed
   stride.
+- **Sprint 17: the prompt's own dispatch description names only "Video Path or
+  Caption Path," but the DoD explicitly requires testing a static image, and
+  the spec's `StructuredContentObject`/§B.5 both treat `image` as a real third
+  `media_type` with its own semantics (`transcript: null`).** There's no
+  "Image Path" component anywhere in the spec to dispatch to. Bridged by
+  adding `video_path.analyze_image()` for the single-image case, reusing
+  Sprint 16's vision-calling logic directly rather than building a separate
+  image-analysis pipeline from scratch - see §3. `route_and_assemble()` is
+  also a standalone function, same as Sprints 12/15/16 - it isn't wired into
+  `/verify/upload` or `/verify/url` yet, and neither of those endpoints passes
+  it a downloaded file path today; that integration is Sprint 18's explicit
+  job ("Full Phase 2 Integration"). Also found and fixed a real gap live:
+  Python's `mimetypes` module doesn't recognize `.webp` by default on this
+  system - see §3.

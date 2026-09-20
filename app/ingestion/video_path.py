@@ -106,8 +106,8 @@ async def transcribe_video(video_path: str) -> TranscriptionResult:
 
 
 VISION_SYSTEM_PROMPT = (
-    "You are shown frames sampled from a video, in chronological order. Do two "
-    "things:\n"
+    "You are shown one or more images - either frames sampled from a video, in "
+    "chronological order, or a single static image. Do two things:\n"
     "1. description: describe the visual content across the frames as a "
     "whole - what's shown, what's happening.\n"
     "2. on_screen_text: transcribe any on-screen text you can read (captions, "
@@ -156,7 +156,7 @@ def _combine_visual_context(description: str, on_screen_text: str) -> str:
 
 
 async def _analyze_frames_with_vision(frame_paths: list[str]) -> _VisionAnalysis:
-    content = [{"type": "text", "text": "Frames sampled from the video, in chronological order:"}]
+    content = [{"type": "text", "text": "Image(s) to analyze, in order:"}]
     for path in frame_paths:
         content.append({"type": "image_url", "image_url": {"url": _encode_frame_as_data_url(path)}})
 
@@ -197,4 +197,20 @@ async def analyze_frames(video_path: str) -> Optional[str]:
     finally:
         shutil.rmtree(frame_dir, ignore_errors=True)
 
+    return _combine_visual_context(analysis.description, analysis.on_screen_text)
+
+
+async def analyze_image(image_path: str) -> Optional[str]:
+    """Sends a single static image directly to GPT-4o Vision - no ffmpeg frame
+    extraction needed, since there's only ever the one frame. Reuses the exact
+    same vision call and combination logic as analyze_frames (spec has no
+    separate "Image Path" component; a static image is just the video path's
+    visual half applied to one image instead of several extracted frames).
+    Never raises - an image that can't be analyzed just contributes no
+    visual_context (None)."""
+    try:
+        analysis = await _analyze_frames_with_vision([image_path])
+    except Exception as exc:
+        logger.info("video_path: image analysis failed for %s (%s)", image_path, exc)
+        return None
     return _combine_visual_context(analysis.description, analysis.on_screen_text)
