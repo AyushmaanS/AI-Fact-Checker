@@ -109,6 +109,8 @@
 
 **Definition of Done:** Given raw results with a mix of source types, the output `EvidencePackage` correctly sorts high-credibility sources first in each list.
 
+> ⚠️ **Extended post-Sprint 5:** each `EvidenceItem` now also carries a code-generated `evidence_id` and an LLM-generated one-line `paraphrase` of its excerpt (added to the same stance-classification call, not a new one) — so later stages never need to re-derive or re-attribute a source. See `docs/phase1-2-functional-spec.md` §A.3b. The ranking/scoring behavior described above is otherwise unchanged.
+
 ---
 
 ### Sprint 6 — Parallelize Research Agents (asyncio)
@@ -135,6 +137,8 @@
 
 > ⚠️ **Superseded post-Sprint 7:** the fringe-vs-consensus threshold check described above (and `AnalystOutput.fringe_vs_consensus_note`) was removed and replaced with a single capped weighted-evidence-score computed in the Evidence Ranker (`EvidencePackage.confidence_raw`, via `evidence_ranker.compute_evidence_score`) — see `docs/phase1-2-functional-spec.md` §A.2/§A.3 for the current behavior. The prompt text above is kept as the historical record of what Sprint 7 originally built; it is no longer what the code does.
 
+> ⚠️ **Superseded again:** `for_summary`/`against_summary` (and the LLM call that wrote them) are also gone. `AnalystOutput` now carries `selected_for_ids`/`selected_against_ids` — each side's top 3 `EvidenceItem`s by `credibility_weight`, chosen by **plain code**, no LLM call involved. The Analyst Agent's only remaining LLM call sets `outdated_flag`. See `docs/phase1-2-functional-spec.md` §A.3b. The prompt text above (including its already-superseded fringe-vs-consensus mention) is kept as historical record only.
+
 ---
 
 ### Sprint 8 — Verdict Agent + Citation-Enforcement Validator
@@ -146,6 +150,8 @@
 > Implement `app/agents/verdict_agent.py` per the spec. Input: `Claim` + `AnalystOutput`. Use `gpt-4o` with a prompt that explicitly instructs: "every factual statement in your rationale must be followed by a citation reference like [SOURCE_1]; you may not make any factual assertion without one." Output must validate against the `Verdict` Pydantic model with the 7-label taxonomy (see `docs/phase1-2-functional-spec.md` §A.2's noted open question — implement exactly the 7 labels as-is, no `DISPUTED`). Add a **two-stage citation validator** (see `docs/phase1-2-functional-spec.md` §A.3a): Stage 1 is the original heuristic, unchanged — scan each sentence for a number, a named entity, or an assertion verb, with no valid `[SOURCE_N]` tag. Stage 2 batches everything Stage 1 flags into one `gpt-4o-mini` structured-output call that classifies each sentence as either a genuinely new, fact-checkable detail (stays flagged) or evaluative/summary language restating an already-cited fact (dropped). The retry/fallback mechanics are unchanged: if anything's still flagged after the two-stage check, re-prompt once with an explicit correction instruction, run the two-stage check again, and only fail if it's still flagged. Write pytest cases that hand-craft evidence to try to trigger at least 4 of the 7 verdict labels, plus these two required regression cases: (a) `"The claim that 'The Eiffel Tower was completed in 1889' is corroborated by clear and reliable evidence."` (with the date fact already cited in an earlier sentence) must NOT be flagged; (b) `"The tower stands 330 meters tall."` (uncited, no obvious trigger verb) must still be flagged.
 
 **Definition of Done:** Verdict output always includes ≥1 valid citation per factual sentence in manual review across several test claims; the re-prompt-on-missing-citation path is demonstrably triggered at least once in testing; both regression cases (a) and (b) pass.
+
+> ⚠️ **Superseded:** the two-stage citation validator (§A.3a) — and the structured-rationale-segments design that replaced it after that — are both gone, along with the `[SOURCE_N]` tag scheme this prompt describes. The Verdict Agent's one `gpt-4o` call now produces only `label` + `summary_line` + `confidence_score`; it's never shown a raw URL and never asked to cite one. `EvidenceLine`s (paraphrase + citation, one per selected `EvidenceItem`) are assembled entirely in code before that call. `summary_line` is audited for a smuggled-in new fact (`audit_summary_line`); on repeated failure it falls back to `UNVERIFIABLE` **in place**, keeping the real evidence and citations rather than discarding them (`produce_verdict` no longer raises at all). See `docs/phase1-2-functional-spec.md` §A.3b. The prompt text and regression cases above are kept as historical record only.
 
 ---
 
@@ -159,6 +165,8 @@
 
 **Definition of Done:** A verdict with one planted bad citation comes out of this step with that citation removed and confidence visibly reduced.
 
+> ⚠️ **Updated:** the Citation Verifier now operates on `Verdict.evidence_lines` rather than `Verdict.citations` directly — it verifies each line's `paraphrase` against its `citation`, and removes the whole `EvidenceLine` (not just a citation string) on a mismatch, recomputing `citations` from what remains. `summary_line` is never fetched or verified. See `docs/phase1-2-functional-spec.md` §A.3b. The fetch/penalty mechanics described above (timeout, -15% confidence per removed item, "can't fetch = inconclusive, not a failure") are unchanged.
+
 ---
 
 ### Sprint 10 — Response Formatter + Full Pipeline Wiring (Phase 1 End-to-End!)
@@ -170,6 +178,8 @@
 > Implement `app/agents/response_formatter.py` (assembles final `Verdict[]` into a `VerifyResponse`, computing a simple `aggregate_label` when there are multiple claims — e.g., if any claim is `FALSE`, aggregate is at least `PARTIALLY_TRUE`; if any is `MISLEADING`, treat that as equally severe). Then build `app/routes/verify.py` with `POST /verify` (per `docs/phase1-2-functional-spec.md` §A.4) that runs the full pipeline in order: intent classification → claim extraction → parallel research (Sprint 6's function) → analyst → verdict → citation verification → response formatting, persisting the submission/claims/verdicts to Supabase along the way. Wire it into `app/main.py`. Handle the edge cases from spec §A.5 (empty input, zero-claim input, non-factual input short-circuiting).
 
 **Definition of Done:** Paste a real, previously-unseen claim into `POST /verify` (via the FastAPI `/docs` Swagger UI) and get back a full, correctly-labeled, cited `VerifyResponse` in under ~90 seconds. This is genuinely the core product working — worth pausing to enjoy it.
+
+> ⚠️ **Updated:** the Response Formatter renders each `evidence_lines` entry (paraphrase + citation) followed by `summary_line` as the closing sentence, instead of joining rationale segments (`response_formatter.format_verdict_text`). Pipeline wiring is otherwise unchanged — same agent order, same concurrency structure from Sprint 6. One simplification: `pipeline._process_one_claim` no longer wraps the Verdict Agent call in a try/except, since `produce_verdict` never raises anymore (see §A.3b) — it degrades to an explained `UNVERIFIABLE` internally instead of raising up to the caller.
 
 ---
 

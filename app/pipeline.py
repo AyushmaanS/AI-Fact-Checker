@@ -1,23 +1,13 @@
 import asyncio
-import logging
-from datetime import datetime, timezone
 
 from app.agents.analyst_agent import analyze_evidence
 from app.agents.citation_verifier import verify_citations
 from app.agents.evidence_ranker import rank_evidence
 from app.agents.research_agent import research_claim
-from app.agents.verdict_agent import VerdictCitationError, produce_verdict
-from app.models.schemas import Claim, EvidencePackage, RationaleSegment, Verdict
-
-logger = logging.getLogger(__name__)
+from app.agents.verdict_agent import produce_verdict
+from app.models.schemas import Claim, EvidencePackage, Verdict
 
 MAX_CONCURRENT_RESEARCH = 8
-
-UNCITED_FALLBACK_RATIONALE = (
-    "This claim's evidence was researched, but a fully-cited verdict could not be "
-    "produced after a correction attempt, so no verdict is being reported rather "
-    "than risk shipping an inadequately-sourced one."
-)
 
 
 async def _research_and_rank(claim: Claim, semaphore: asyncio.Semaphore) -> EvidencePackage:
@@ -50,29 +40,10 @@ async def _process_one_claim(claim: Claim, semaphore: asyncio.Semaphore) -> Verd
         raw_results = await research_claim(claim)
         evidence = await rank_evidence(claim, raw_results)
         analyst = await analyze_evidence(claim, evidence)
-
-        try:
-            verdict = await produce_verdict(claim, analyst, evidence)
-        except VerdictCitationError as exc:
-            # The citation validator's retry-then-fail safety net (Sprint 8) is
-            # working as designed here, not malfunctioning - refusing to ship an
-            # under-cited verdict. The API still owes the caller a Verdict object
-            # per claim, so this degrades to an explained UNVERIFIABLE rather than
-            # letting the exception propagate into a 500 for the whole request.
-            logger.warning("claim %s: %s", claim.claim_id, exc)
-            return Verdict(
-                claim_id=claim.claim_id,
-                label="UNVERIFIABLE",
-                rationale_segments=[
-                    RationaleSegment(
-                        text=UNCITED_FALLBACK_RATIONALE, segment_type="connective_reasoning"
-                    )
-                ],
-                confidence_score=0.0,
-                citations=[],
-                created_at=datetime.now(timezone.utc),
-            )
-
+        # produce_verdict never raises - it degrades to an explained UNVERIFIABLE
+        # internally (keeping any real evidence_lines/citations) if the audit still
+        # fails after one retry, so there's no failure mode left to catch here.
+        verdict = await produce_verdict(claim, analyst, evidence)
         return await verify_citations(verdict)
 
 

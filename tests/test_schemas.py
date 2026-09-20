@@ -1,13 +1,10 @@
 from datetime import datetime, timezone
 
-import pytest
-from pydantic import ValidationError
-
 from app.models.schemas import (
     Claim,
     EvidenceItem,
+    EvidenceLine,
     EvidencePackage,
-    RationaleSegment,
     Verdict,
 )
 
@@ -36,13 +33,15 @@ def test_verdict_accepts_all_seven_labels():
         verdict = Verdict(
             claim_id="c1",
             label=label,
-            rationale_segments=[
-                RationaleSegment(
-                    text="Confirmed by the source.",
-                    segment_type="sourced_fact",
+            evidence_lines=[
+                EvidenceLine(
+                    paraphrase="Confirmed by the source.",
                     citation="https://example.com",
+                    stance="for",
+                    credibility_weight=0.8,
                 )
             ],
+            summary_line="This confirms the claim.",
             confidence_score=0.9,
             citations=["https://example.com"],
             created_at=datetime.now(timezone.utc),
@@ -50,40 +49,45 @@ def test_verdict_accepts_all_seven_labels():
         assert verdict.label == label
 
 
-def test_verdict_rejects_sourced_fact_without_citation():
-    with pytest.raises(ValidationError):
-        Verdict(
-            claim_id="c1",
-            label="TRUE",
-            rationale_segments=[
-                RationaleSegment(text="A fact with no source.", segment_type="sourced_fact", citation=None)
-            ],
-            confidence_score=0.9,
-            citations=["https://example.com"],
-            created_at=datetime.now(timezone.utc),
-        )
-
-
-def test_verdict_accepts_connective_segment_without_citation():
+def test_verdict_accepts_empty_evidence_lines():
+    # The no-sources short circuit produces a Verdict with no evidence at all.
+    # Nothing in the schema forbids this: unlike the old design, the LLM never
+    # writes a citation directly onto a Verdict-level field, so there's no
+    # cross-field invariant left for a validator to enforce.
     verdict = Verdict(
         claim_id="c1",
-        label="TRUE",
-        rationale_segments=[
-            RationaleSegment(text="This confirms the claim.", segment_type="connective_reasoning")
-        ],
-        confidence_score=0.9,
+        label="UNVERIFIABLE",
+        evidence_lines=[],
+        summary_line="No usable sources were found.",
+        confidence_score=0.0,
         citations=[],
         created_at=datetime.now(timezone.utc),
     )
-    assert verdict.rationale_segments[0].citation is None
+    assert verdict.evidence_lines == []
 
 
-def test_evidence_package_shape():
+def test_evidence_item_has_id_and_paraphrase():
     item = EvidenceItem(
+        evidence_id="c1_0",
         source_url="https://example.com",
         source_category="Major Wire Services",
         credibility_weight=0.82,
         excerpt="An excerpt.",
+        paraphrase="A one-line paraphrase of the excerpt.",
+        stance="for",
+    )
+    assert item.evidence_id == "c1_0"
+    assert item.paraphrase
+
+
+def test_evidence_package_shape():
+    item = EvidenceItem(
+        evidence_id="c1_0",
+        source_url="https://example.com",
+        source_category="Major Wire Services",
+        credibility_weight=0.82,
+        excerpt="An excerpt.",
+        paraphrase="A one-line paraphrase.",
         stance="for",
     )
     package = EvidencePackage(

@@ -5,10 +5,10 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from app.agents.verdict_agent import NO_SOURCES_RATIONALE
 from app.config import FASTROUTER_API_KEY, SUPABASE_KEY, SUPABASE_URL, TAVILY_API_KEY
 from app.main import app
-from app.models.schemas import Claim, ContentIntent, RationaleSegment, Verdict
-from app.pipeline import UNCITED_FALLBACK_RATIONALE
+from app.models.schemas import Claim, ContentIntent, EvidenceLine, Verdict
 
 client = TestClient(app)
 
@@ -82,9 +82,12 @@ def test_verdict_persisted_with_correct_db_claim_id_mapping(
     verdict = Verdict(
         claim_id="c1",
         label="TRUE",
-        rationale_segments=[
-            RationaleSegment(text="Rationale.", segment_type="sourced_fact", citation="https://example.com")
+        evidence_lines=[
+            EvidenceLine(
+                paraphrase="Rationale.", citation="https://example.com", stance="for", credibility_weight=0.9
+            )
         ],
+        summary_line="This confirms the claim.",
         confidence_score=0.9,
         citations=["https://example.com"],
         created_at=datetime.now(timezone.utc),
@@ -116,10 +119,8 @@ def test_verify_endpoint_live_end_to_end():
     assert verdict["label"] in {
         "TRUE", "FALSE", "PARTIALLY_TRUE", "MISLEADING", "UNVERIFIABLE", "OUTDATED", "SATIRE"
     }
-    # Either a real cited verdict, or (rarely) the citation validator's graceful
-    # fallback (Sprint 8/10) - both are correct outcomes, see pipeline.py.
-    assert (
-        verdict["citations"]
-        or verdict["rationale_segments"][0]["text"] == UNCITED_FALLBACK_RATIONALE
-    )
+    # Either real cited evidence, or (rarely) the no-usable-sources short circuit -
+    # both are correct outcomes. produce_verdict never raises in the new design, so
+    # there's no separate "graceful fallback" text to also check for here.
+    assert verdict["citations"] or verdict["summary_line"] == NO_SOURCES_RATIONALE
     assert body["aggregate_label"] == verdict["label"]

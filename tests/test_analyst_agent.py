@@ -2,12 +2,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.agents.analyst_agent import (
-    NO_AGAINST_EVIDENCE_TEXT,
-    NO_FOR_EVIDENCE_TEXT,
-    _AnalystLLMOutput,
-    analyze_evidence,
-)
+from app.agents.analyst_agent import _AnalystLLMOutput, _select_top_ids, analyze_evidence
 from app.agents.evidence_ranker import rank_evidence
 from app.agents.research_agent import research_claim
 from app.config import FASTROUTER_API_KEY, SUPABASE_KEY, SUPABASE_URL, TAVILY_API_KEY
@@ -20,23 +15,40 @@ def _claim() -> Claim:
     )
 
 
-def _evidence_item(weight: float, stance: str, excerpt: str = "evidence") -> EvidenceItem:
+def _evidence_item(evidence_id: str, weight: float, stance: str) -> EvidenceItem:
     return EvidenceItem(
-        source_url="https://example.com",
+        evidence_id=evidence_id,
+        source_url=f"https://example.com/{evidence_id}",
         source_category="Test",
         credibility_weight=weight,
-        excerpt=excerpt,
+        excerpt="evidence",
+        paraphrase="A paraphrase.",
         stance=stance,
     )
 
 
-def _mock_completion(for_summary: str, against_summary: str, outdated_flag: bool) -> MagicMock:
-    parsed = _AnalystLLMOutput(
-        for_summary=for_summary, against_summary=against_summary, outdated_flag=outdated_flag
-    )
+def _mock_completion(outdated_flag: bool) -> MagicMock:
+    parsed = _AnalystLLMOutput(outdated_flag=outdated_flag)
     completion = MagicMock()
     completion.choices = [MagicMock(message=MagicMock(parsed=parsed))]
     return completion
+
+
+# --- selection: plain code, no LLM call ---
+
+
+def test_select_top_ids_picks_three_highest_by_credibility_without_llm():
+    items = [
+        _evidence_item("a", 0.3, "for"),
+        _evidence_item("b", 0.9, "for"),
+        _evidence_item("c", 0.5, "for"),
+        _evidence_item("d", 0.7, "for"),
+    ]
+    assert _select_top_ids(items) == ["b", "d", "c"]
+
+
+def test_select_top_ids_handles_zero_items():
+    assert _select_top_ids([]) == []
 
 
 async def test_fully_empty_evidence_never_calls_llm():
@@ -47,44 +59,37 @@ async def test_fully_empty_evidence_never_calls_llm():
         result = await analyze_evidence(_claim(), evidence)
         mock_get_client.assert_not_called()
 
-    assert result.for_summary == NO_FOR_EVIDENCE_TEXT
-    assert result.against_summary == NO_AGAINST_EVIDENCE_TEXT
+    assert result.selected_for_ids == []
+    assert result.selected_against_ids == []
     assert result.outdated_flag is False
 
 
 @patch("app.agents.analyst_agent.get_async_llm_client")
-async def test_one_sided_evidence_gets_deterministic_against_summary(mock_get_client):
-    # Even if the (mocked) model returns junk for against_summary, it must be ignored -
-    # this is the "deliberately one-sided EvidencePackage" case the sprint asks for.
+async def test_selected_ids_survive_alongside_llm_outdated_flag(mock_get_client):
     mock_client = MagicMock()
-    mock_client.chat.completions.parse = AsyncMock(
-        return_value=_mock_completion(
-            for_summary="Multiple credible sources confirm this.",
-            against_summary="this should never surface",
-            outdated_flag=False,
-        )
-    )
+    mock_client.chat.completions.parse = AsyncMock(return_value=_mock_completion(outdated_flag=True))
     mock_get_client.return_value = mock_client
 
     evidence = EvidencePackage(
         claim_id="c1",
-        evidence_for=[_evidence_item(0.9, "for")],
-        evidence_against=[],
-        sources=["https://example.com"],
-        confidence_raw=1.0,
+        evidence_for=[_evidence_item("a", 0.9, "for")],
+        evidence_against=[_evidence_item("b", 0.8, "against")],
+        sources=["https://example.com/a", "https://example.com/b"],
+        confidence_raw=0.6,
     )
 
     result = await analyze_evidence(_claim(), evidence)
 
-    assert result.against_summary == NO_AGAINST_EVIDENCE_TEXT
-    assert result.for_summary == "Multiple credible sources confirm this."
+    assert result.selected_for_ids == ["a"]
+    assert result.selected_against_ids == ["b"]
+    assert result.outdated_flag is True
 
 
 @pytest.mark.skipif(
     not (TAVILY_API_KEY and FASTROUTER_API_KEY and SUPABASE_URL and SUPABASE_KEY),
     reason="TAVILY_API_KEY / FASTROUTER_API_KEY / SUPABASE_URL / SUPABASE_KEY not set in .env",
 )
-async def test_analyze_evidence_live_one_sided():
+async def test_analyze_evidence_live():
     claim = Claim(
         claim_id="c1",
         text="The Eiffel Tower was completed in 1889.",
@@ -96,7 +101,6 @@ async def test_analyze_evidence_live_one_sided():
     evidence = await rank_evidence(claim, raw)
     result = await analyze_evidence(claim, evidence)
 
-    assert result.for_summary
-    assert result.against_summary
-    if not evidence.evidence_against:
-        assert result.against_summary == NO_AGAINST_EVIDENCE_TEXT
+    assert isinstance(result.outdated_flag, bool)
+    assert set(result.selected_for_ids) <= {item.evidence_id for item in evidence.evidence_for}
+    assert set(result.selected_against_ids) <= {item.evidence_id for item in evidence.evidence_against}

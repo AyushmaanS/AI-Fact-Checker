@@ -14,17 +14,23 @@ DEFAULT_WEIGHT = 0.4
 EVIDENCE_CAP = 5
 
 STANCE_SYSTEM_PROMPT = (
-    "You judge whether each piece of evidence supports (\"for\") or contradicts "
-    "(\"against\") a claim. If a piece of evidence is neutral, tangential, or merely "
-    "provides context without disputing the claim, classify it as \"for\" (it does not "
-    "contradict the claim). Only use \"against\" when the evidence actually disputes "
-    "or contradicts the claim. Return one stance per numbered item, using the same index."
+    "For each numbered piece of evidence, do two things:\n"
+    "1. Judge whether it supports (\"for\") or contradicts (\"against\") the claim. If "
+    "a piece of evidence is neutral, tangential, or merely provides context without "
+    "disputing the claim, classify it as \"for\" (it does not contradict the claim). "
+    "Only use \"against\" when the evidence actually disputes or contradicts the claim.\n"
+    "2. Write a one-line, self-contained paraphrase of what the excerpt says, in your "
+    "own words - specific enough to stand alone as a fact (keep the concrete detail: "
+    "the number, date, name, or event), introducing nothing beyond what the excerpt "
+    "itself states.\n"
+    "Return one stance and one paraphrase per numbered item, using the same index."
 )
 
 
 class _StanceItem(BaseModel):
     index: int
     stance: Literal["for", "against"]
+    paraphrase: str
 
 
 class _StanceBatch(BaseModel):
@@ -54,7 +60,7 @@ def _lookup_credibility(domain: str, table: list[dict]) -> tuple[str, float]:
     return DEFAULT_CATEGORY, DEFAULT_WEIGHT
 
 
-async def _classify_stances(claim_text: str, results: list[RawSearchResult]) -> list[str]:
+async def _classify_stances(claim_text: str, results: list[RawSearchResult]) -> list[_StanceItem]:
     if not results:
         return []
     numbered = "\n".join(f"{i}. {r.title} - {r.snippet}" for i, r in enumerate(results))
@@ -68,8 +74,17 @@ async def _classify_stances(claim_text: str, results: list[RawSearchResult]) -> 
         ],
         response_format=_StanceBatch,
     )
-    stance_map = {item.index: item.stance for item in completion.choices[0].message.parsed.items}
-    return [stance_map.get(i, "for") for i in range(len(results))]
+    by_index = {item.index: item for item in completion.choices[0].message.parsed.items}
+
+    output: list[_StanceItem] = []
+    for i, result in enumerate(results):
+        item = by_index.get(i)
+        if item is None:
+            # No classification returned for this index - default to "for" (as
+            # before) and fall back to the raw snippet so paraphrase is never blank.
+            item = _StanceItem(index=i, stance="for", paraphrase=result.snippet)
+        output.append(item)
+    return output
 
 
 def compute_evidence_score(
@@ -89,24 +104,28 @@ async def rank_evidence(claim: Claim, raw_results: list[RawSearchResult]) -> Evi
     # _get_credibility_table is sync (cached after its first Supabase call) - run it
     # off the event loop so it can never block other claims' concurrent work.
     credibility_table = await asyncio.to_thread(_get_credibility_table)
-    stances = await _classify_stances(claim.text, raw_results)
+    stance_items = await _classify_stances(claim.text, raw_results)
 
     evidence_for: list[EvidenceItem] = []
     evidence_against: list[EvidenceItem] = []
     sources: list[str] = []
 
-    for result, stance in zip(raw_results, stances):
+    for index, (result, stance_item) in enumerate(zip(raw_results, stance_items)):
         domain = _domain_from_url(result.url)
         category, weight = _lookup_credibility(domain, credibility_table)
         item = EvidenceItem(
+            # Generated in code, from each claim's own raw-results position - unique
+            # per claim regardless of which side (for/against) an item ends up on.
+            evidence_id=f"{claim.claim_id}_{index}",
             source_url=result.url,
             source_category=category,
             credibility_weight=weight,
             excerpt=result.snippet,
-            stance=stance,
+            paraphrase=stance_item.paraphrase,
+            stance=stance_item.stance,
             published_date=result.published_date,
         )
-        (evidence_for if stance == "for" else evidence_against).append(item)
+        (evidence_for if stance_item.stance == "for" else evidence_against).append(item)
         sources.append(result.url)
 
     evidence_for.sort(key=lambda i: i.credibility_weight, reverse=True)

@@ -31,10 +31,13 @@ def compute_aggregate_label(verdicts: list[Verdict]) -> Optional[str]:
     return max(labels, key=_SEVERITY_ORDER.index)
 
 
-def join_rationale_segments(verdict: Verdict) -> str:
-    """Joins a Verdict's rationale_segments into one plain-text paragraph, in
-    order - for the DM/web response, and for DB storage (see routes/verify.py)."""
-    return " ".join(segment.text for segment in verdict.rationale_segments)
+def format_verdict_text(verdict: Verdict) -> str:
+    """Renders a Verdict as plain text: each evidence line (its paraphrase, with
+    its citation), one per line, followed by summary_line as the closing
+    sentence - for the DM/web response, and for DB storage (see routes/verify.py)."""
+    lines = [f"{line.paraphrase} ({line.citation})" for line in verdict.evidence_lines]
+    lines.append(verdict.summary_line)
+    return "\n".join(lines)
 
 
 def format_response(

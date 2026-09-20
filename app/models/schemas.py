@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel
 
 
 class ContentIntent(BaseModel):
@@ -18,10 +18,12 @@ class Claim(BaseModel):
 
 
 class EvidenceItem(BaseModel):
+    evidence_id: str
     source_url: str
     source_category: str  # one of the 8 credibility tiers
     credibility_weight: float  # 0.10-0.95, from the seeded table
     excerpt: str
+    paraphrase: str  # one-line paraphrase, generated once here while still tied to a fixed source
     stance: Literal["for", "against"]
     published_date: Optional[str] = None
 
@@ -39,39 +41,41 @@ class EvidencePackage(BaseModel):
 
 class AnalystOutput(BaseModel):
     claim_id: str
-    for_summary: str
-    against_summary: str  # MUST be populated - see functional spec A.5
+    # Plain-code selection (top 3 per side by credibility_weight) - see
+    # analyst_agent._select_top_ids. Not an LLM judgment call.
+    selected_for_ids: list[str]
+    selected_against_ids: list[str]
     outdated_flag: bool = False
 
 
-class RationaleSegment(BaseModel):
-    text: str
-    # sourced_fact: a specific, checkable detail - needs `citation`.
-    # connective_reasoning: reasons over already-cited facts - must not have one.
-    segment_type: Literal["sourced_fact", "connective_reasoning"]
-    citation: Optional[str] = None
+class EvidenceLine(BaseModel):
+    """A single piece of evidence, assembled entirely from code (see
+    verdict_agent._build_evidence_lines) from an EvidenceItem the Analyst Agent
+    selected - never produced by an LLM call."""
+
+    paraphrase: str
+    citation: str
+    stance: Literal["for", "against"]
+    credibility_weight: float
+
+
+class VerdictAgentOutput(BaseModel):
+    """The only thing the Verdict Agent's LLM call produces - no citations, no
+    evidence, nothing that could ever be mismatched against a source."""
+
+    label: Literal["TRUE", "FALSE", "PARTIALLY_TRUE", "MISLEADING", "UNVERIFIABLE", "OUTDATED", "SATIRE"]
+    summary_line: str
+    confidence_score: float
 
 
 class Verdict(BaseModel):
     claim_id: str
     label: Literal["TRUE", "FALSE", "PARTIALLY_TRUE", "MISLEADING", "UNVERIFIABLE", "OUTDATED", "SATIRE"]
-    rationale_segments: list[RationaleSegment]
+    evidence_lines: list[EvidenceLine]
+    summary_line: str
     confidence_score: float
-    citations: list[str]  # every sourced_fact segment's citation must be one of these
+    citations: list[str]  # always derived: deduplicated evidence_lines[*].citation, never LLM-produced
     created_at: datetime
-
-    @model_validator(mode="after")
-    def _sourced_facts_have_valid_citations(self) -> "Verdict":
-        for segment in self.rationale_segments:
-            if segment.segment_type != "sourced_fact":
-                continue
-            if not segment.citation:
-                raise ValueError(f"sourced_fact segment has no citation: {segment.text!r}")
-            if segment.citation not in self.citations:
-                raise ValueError(
-                    f"sourced_fact segment cites {segment.citation!r}, not in citations: {segment.text!r}"
-                )
-        return self
 
 
 class VerifyResponse(BaseModel):
