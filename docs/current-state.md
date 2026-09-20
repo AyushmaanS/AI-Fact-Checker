@@ -1,5 +1,5 @@
 # Current State
-**Last updated:** 2026-09-20 · after Sprint 13 + 4 Phase-1 retrofits · commit `49bf3d8`
+**Last updated:** 2026-09-20 · after Sprint 14 + 4 Phase-1 retrofits · commit `61adfb5`
 
 Living snapshot of what's actually true in the code right now. The other docs in
 this folder (`prd-v1-draft.md`, `phase1-2-functional-spec.md`,
