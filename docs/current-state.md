@@ -12,7 +12,7 @@ and those diverge.
 ## 1. What's implemented
 
 **Phase 1 (Sprints 0–11): done.** Phase 2 (Sprints 12–18, video/image ingestion):
-**started** — Sprints 12–15 done, 16–18 not started.
+**started** — Sprints 12–16 done, 17–18 not started.
 
 | Sprint | What it built |
 |---|---|
@@ -32,6 +32,7 @@ and those diverge.
 | 13 | `app/ingestion/caption_path.py` + `POST /verify/upload` (ingestion only — see §9) |
 | 14 | `app/ingestion/media_downloader.py` (yt-dlp) + `POST /verify/url` (ingestion only — see §9) |
 | 15 | `app/ingestion/video_path.py` audio portion (ffmpeg + Whisper transcription) — standalone, not wired in yet (see §9) |
+| 16 | `app/ingestion/video_path.py` frame sampling + GPT-4o Vision (`analyze_frames`) — standalone, not wired in yet (see §9) |
 
 Plus 4 retrofits not tied to a sprint number, each shipped after the sprint that
 introduced the thing it replaced, each verified live before landing (details in §9):
@@ -217,6 +218,23 @@ retrofit 4 except removing a now-dead try/except, see §9), `routes/verify.py`
   trips the flag - not averaged away - since a fabricated "fact" threaded into
   real speech is exactly what a fact-checking product can't afford to trust
   silently. See §8 for the live verification.
+- **Frame sampling batches all selected frames into ONE GPT-4o Vision call**,
+  not one call per frame (`video_path.analyze_frames`) - cheaper, and lets the
+  model reason across frames as a sequence rather than describing each in
+  isolation. Frames are sampled at 1fps (ffmpeg `fps=1`); videos longer than
+  `MAX_FRAMES_TO_SEND` (10) seconds are evenly downsampled to roughly that many
+  frames rather than sent in full, to control cost on longer videos - a short
+  clip just sends every frame.
+- **Vision output is structured (`label` + `on_screen_text` via
+  `chat.completions.parse`), not a single free-text description** - same
+  pattern as every other LLM call in this codebase. The system prompt
+  explicitly instructs the model not to invent on-screen text that isn't
+  visible; confirmed live it reads real text accurately rather than
+  hallucinating - a burned-in "SALES UP 47 PERCENT" overlay came back
+  transcribed exactly, and a separate video's genuine built-in frame-counter
+  digits (an unintended discovery - ffmpeg's `testsrc` pattern draws a visible
+  running counter) were also read correctly rather than something being
+  invented for a plain background. See §8.
 
 ---
 
@@ -312,7 +330,7 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 
 ## 8. Test / eval status
 
-**95 tests collected** across 16 test files (`test_main`, `test_schemas`,
+**111 tests collected** across 16 test files (`test_main`, `test_schemas`,
 `test_db`, `test_intent_classifier`, `test_claim_extractor`, `test_research_agent`,
 `test_evidence_ranker`, `test_analyst_agent`, `test_verdict_agent`,
 `test_citation_verifier`, `test_verify_route`, `test_pipeline`, `test_url_resolver`,
@@ -320,14 +338,15 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 `test_url_resolver` tests are Sprint 12's; 5 in `test_caption_path` plus 5
 upload-endpoint tests in `test_verify_route` are Sprint 13's; 4 in
 `test_media_downloader` plus 4 url-endpoint tests in `test_verify_route` are
-Sprint 14's; the 12 in `test_video_path` are Sprint 15's — all 40 deterministic,
-no network, no live-key gating (Sprints 14/15's real yt-dlp/ffmpeg/Whisper/DB
-behavior was instead verified with real, ad-hoc live checks, not baked into the
-permanent suite - see the note below on why). **All pass**, including every live test
+Sprint 14's; 12 in `test_video_path` are Sprint 15's and 12 more in the same
+file are Sprint 16's — all 52 deterministic, no network, no live-key gating
+(Sprints 14/15/16's real yt-dlp/ffmpeg/Whisper/Vision/DB behavior was instead
+verified with real, ad-hoc live checks, not baked into the permanent suite -
+see the note below on why). **All pass**, including every live test
 (needs `FASTROUTER_API_KEY` / `TAVILY_API_KEY` / Supabase creds) — confirmed via
 two full consecutive runs after retrofit 4, the second one clean, plus the
-non-live subset (90 tests) confirmed clean again after Sprint 15, most recently
-90 passed / 5 deselected (one flaky live-marked test not caught by that filter,
+non-live subset (106 tests) confirmed clean again after Sprint 16, most recently
+106 passed / 5 deselected (one flaky live-marked test not caught by that filter,
 see below). One live test's own expectation had to be fixed along
 the way, during retrofit 4: the old
 "per-URL" citation removal test asserted a shared citation gets fully wiped when
@@ -347,22 +366,30 @@ unrelated to Sprint 15 (which touches only `app/ingestion/video_path.py` and
 adds one unused-elsewhere constant to `llm_client.py`). Not a regression; just a
 reminder that "not live" by keyword isn't the same as "no network calls."
 
-**Sprints 14 and 15's live verification were both deliberately kept out of the
-permanent pytest suite**, unlike every other live test here, because both would
-depend on specific external state staying available indefinitely - one
-specific, currently-real Instagram Reel URL (Sprint 14) - a genuine
-content-liveness risk none of the other live tests carry (they depend on stable
-facts like "the Eiffel Tower was completed in 1889," not on a specific post not
-being deleted). Verified instead via ad-hoc live runs during development. Sprint
-14: a real Reel from `@instagram`'s own account (found by browsing, not
-fabricated) downloaded successfully end-to-end through the actual
-`/verify/url` route with a real Supabase write (3.28MiB file, real extracted
-caption); a deliberately nonexistent reel id (`.../reel/AAAAAAAAAAA/`) failed
-cleanly through the same route with no crash. This same live check is what
-caught the `input_type` bug above. Sprint 15: a real Windows-TTS-generated
+**Sprints 14, 15, and 16's live verification were all deliberately kept out of
+the permanent pytest suite**, unlike every other live test here, though for two
+different reasons depending on the sprint. Sprint 14: a genuine
+content-liveness risk none of the other live tests carry - it would depend on
+one specific, currently-real Instagram Reel URL staying up indefinitely (the
+others depend on stable facts like "the Eiffel Tower was completed in 1889,"
+not on a specific post not being deleted). Sprints 15/16: no content-liveness
+risk at all (all test media is generated locally, deterministically) - kept out
+simply because a real Whisper/Vision API call on every test run is slower and
+costs real money for something the mocked tests already cover logically; the
+live check's job was to prove the mechanism works against reality once, not to
+re-prove it on every future run. Verified instead via ad-hoc live runs during
+development. Sprint 14: a real Reel from `@instagram`'s own account (found by
+browsing, not fabricated) downloaded successfully end-to-end through the
+actual `/verify/url` route with a real Supabase write (3.28MiB file, real
+extracted caption); a deliberately nonexistent reel id (`.../reel/AAAAAAAAAAA/`)
+failed cleanly through the same route with no crash. This same live check is
+what caught the `input_type` bug above. Sprint 15: a real Windows-TTS-generated
 speech clip and an ffmpeg-generated pure-tone clip, each muxed into a real
 video file and run through the actual `transcribe_video()` end to end (not
-mocked) - see §3 for what the tone clip caught.
+mocked) - see §3 for what the tone clip caught. Sprint 16: a real
+ffmpeg-`drawtext`-generated video with a burned-in "SALES UP 47 PERCENT"
+overlay, run through the actual `analyze_frames()` end to end - the on-screen
+text came back transcribed exactly, confirming the DoD directly.
 
 **`eval/run_eval.py` post-retrofit-4: 17/22 (77%), 63.7s total** — above the prior
 design's 64–73% range, so no regression (this single run is also each design's
@@ -472,3 +499,12 @@ full... and confirm no regressions") — retrofit 4 is now fully complete.
   need a real fix once tested live - see §3's write-up of the hallucinated
   "**BLEEP**"/tone-clip finding and why `avg_logprob` had to be added alongside
   `no_speech_prob`, not used as originally scoped.
+- **Sprint 16:** `analyze_frames()` is also a standalone function with no
+  caller yet, same reason as Sprint 15. Sends all selected frames in one
+  `chat.completions.parse` call rather than one call per frame - the prompt's
+  "batch a reasonable subset... to control cost" read as one batched call being
+  the point, not literally separate per-frame calls. `MAX_FRAMES_TO_SEND = 10`
+  and the evenly-strided downsampling formula are this session's own choice,
+  generalizing the prompt's literal "every 3rd frame" example to scale
+  sensibly for both short and long videos rather than hardcoding a fixed
+  stride.

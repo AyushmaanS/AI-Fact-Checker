@@ -1,17 +1,26 @@
 import asyncio
+import base64
 import logging
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 import imageio_ffmpeg
 from pydantic import BaseModel
 
-from app.llm_client import MODEL_WHISPER, get_async_llm_client
+from app.llm_client import MODEL_GPT4O, MODEL_WHISPER, get_async_llm_client
 
 logger = logging.getLogger(__name__)
 
 AUDIO_EXTRACT_TIMEOUT = 60.0
+FRAME_EXTRACT_TIMEOUT = 60.0
+
+# Sampled at 1fps (per the sprint prompt); a video longer than this many
+# seconds gets evenly downsampled to roughly this many frames before being
+# sent to GPT-4o Vision, to control cost - a short clip just sends every frame.
+MAX_FRAMES_TO_SEND = 10
 
 # Whisper's own commonly-used reference-decoder defaults, used together, not
 # separately - confirmed live that no_speech_prob alone misses real
@@ -94,3 +103,98 @@ async def transcribe_video(video_path: str) -> TranscriptionResult:
     text = response.text or ""
     low_confidence = _is_low_confidence(text, response.segments or [], response.duration)
     return TranscriptionResult(transcript=text, low_confidence_transcript=low_confidence)
+
+
+VISION_SYSTEM_PROMPT = (
+    "You are shown frames sampled from a video, in chronological order. Do two "
+    "things:\n"
+    "1. description: describe the visual content across the frames as a "
+    "whole - what's shown, what's happening.\n"
+    "2. on_screen_text: transcribe any on-screen text you can read (captions, "
+    "subtitles, overlaid statistics, labels, etc.), exactly as written. Leave "
+    "this an empty string if there is no readable on-screen text in any frame - "
+    "never invent text that isn't actually visible."
+)
+
+
+class _VisionAnalysis(BaseModel):
+    description: str
+    on_screen_text: str
+
+
+def _extract_frames_sync(video_path: str) -> tuple[str, list[str]]:
+    frame_dir = tempfile.mkdtemp(prefix="frames_")
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    subprocess.run(
+        [ffmpeg_exe, "-y", "-i", video_path, "-vf", "fps=1", "-q:v", "2", f"{frame_dir}/frame_%04d.jpg"],
+        capture_output=True,
+        check=True,
+        timeout=FRAME_EXTRACT_TIMEOUT,
+    )
+    frame_paths = sorted(str(p) for p in Path(frame_dir).iterdir() if p.is_file())
+    return frame_dir, frame_paths
+
+
+def _select_frames(frame_paths: list[str]) -> list[str]:
+    if len(frame_paths) <= MAX_FRAMES_TO_SEND:
+        return frame_paths
+    stride = max(1, len(frame_paths) // MAX_FRAMES_TO_SEND)
+    return frame_paths[::stride][:MAX_FRAMES_TO_SEND]
+
+
+def _encode_frame_as_data_url(frame_path: str) -> str:
+    encoded = base64.b64encode(Path(frame_path).read_bytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _combine_visual_context(description: str, on_screen_text: str) -> str:
+    description = description.strip()
+    on_screen_text = on_screen_text.strip()
+    if not on_screen_text:
+        return description
+    return f"{description}\n\nOn-screen text: {on_screen_text}"
+
+
+async def _analyze_frames_with_vision(frame_paths: list[str]) -> _VisionAnalysis:
+    content = [{"type": "text", "text": "Frames sampled from the video, in chronological order:"}]
+    for path in frame_paths:
+        content.append({"type": "image_url", "image_url": {"url": _encode_frame_as_data_url(path)}})
+
+    completion = await get_async_llm_client().chat.completions.parse(
+        model=MODEL_GPT4O,
+        messages=[
+            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ],
+        response_format=_VisionAnalysis,
+    )
+    return completion.choices[0].message.parsed
+
+
+async def analyze_frames(video_path: str) -> Optional[str]:
+    """Extracts ~1fps frames (ffmpeg), sends a representative subset (capped at
+    MAX_FRAMES_TO_SEND, evenly downsampled for longer videos) to GPT-4o Vision
+    in one call, and combines its scene description with any on-screen text it
+    transcribed into a single visual_context string. Never raises - a video
+    whose frames can't be extracted or analyzed just contributes no
+    visual_context (None), same graceful-degradation stance transcribe_video
+    takes on audio."""
+    try:
+        frame_dir, frame_paths = await asyncio.to_thread(_extract_frames_sync, video_path)
+    except Exception as exc:
+        logger.info("video_path: frame extraction failed for %s (%s)", video_path, exc)
+        return None
+
+    if not frame_paths:
+        shutil.rmtree(frame_dir, ignore_errors=True)
+        return None
+
+    try:
+        analysis = await _analyze_frames_with_vision(_select_frames(frame_paths))
+    except Exception as exc:
+        logger.info("video_path: vision analysis failed for %s (%s)", video_path, exc)
+        return None
+    finally:
+        shutil.rmtree(frame_dir, ignore_errors=True)
+
+    return _combine_visual_context(analysis.description, analysis.on_screen_text)

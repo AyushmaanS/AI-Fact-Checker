@@ -1,9 +1,19 @@
+import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.ingestion.video_path import _is_low_confidence, transcribe_video
+from app.ingestion.video_path import (
+    MAX_FRAMES_TO_SEND,
+    _combine_visual_context,
+    _encode_frame_as_data_url,
+    _is_low_confidence,
+    _select_frames,
+    _VisionAnalysis,
+    analyze_frames,
+    transcribe_video,
+)
 
 
 def _segment(no_speech_prob: float, avg_logprob: float = -0.3, text: str = "some text") -> SimpleNamespace:
@@ -160,3 +170,135 @@ async def test_transcribe_video_cleans_up_extracted_audio_file(mock_extract, moc
     assert Path(audio_path).exists()
     await transcribe_video("/tmp/fake_video.mp4")
     assert not Path(audio_path).exists()
+
+
+# --- Sprint 16: frame sampling + GPT-4o Vision ---
+
+
+def _fake_frame_dir(num_frames: int) -> tuple[str, list[str]]:
+    frame_dir = tempfile.mkdtemp(prefix="test_frames_")
+    paths = []
+    for i in range(num_frames):
+        path = os.path.join(frame_dir, f"frame_{i:04d}.jpg")
+        with open(path, "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0fake jpeg bytes")  # real JPEG magic bytes, fake payload
+        paths.append(path)
+    return frame_dir, paths
+
+
+def _vision_analysis(description: str, on_screen_text: str = "") -> _VisionAnalysis:
+    return _VisionAnalysis(description=description, on_screen_text=on_screen_text)
+
+
+# --- _select_frames ---
+
+
+def test_select_frames_returns_all_when_under_cap():
+    paths = [f"frame_{i}.jpg" for i in range(5)]
+    assert _select_frames(paths) == paths
+
+
+def test_select_frames_returns_all_when_exactly_at_cap():
+    paths = [f"frame_{i}.jpg" for i in range(MAX_FRAMES_TO_SEND)]
+    assert _select_frames(paths) == paths
+
+
+def test_select_frames_downsamples_evenly_when_over_cap():
+    paths = [f"frame_{i}.jpg" for i in range(97)]  # a long ~97-second video
+    selected = _select_frames(paths)
+    assert len(selected) <= MAX_FRAMES_TO_SEND
+    assert len(selected) > 0
+    # Order is preserved and it's an even stride, not just the first N frames.
+    assert selected == sorted(selected, key=paths.index)
+    assert selected[-1] != paths[MAX_FRAMES_TO_SEND - 1]  # actually strided, not truncated
+
+
+# --- _combine_visual_context ---
+
+
+def test_combine_visual_context_with_on_screen_text():
+    result = _combine_visual_context("A person at a podium.", "SALES UP 47 PERCENT")
+    assert result == "A person at a podium.\n\nOn-screen text: SALES UP 47 PERCENT"
+
+
+def test_combine_visual_context_without_on_screen_text():
+    result = _combine_visual_context("A quiet street scene.", "")
+    assert result == "A quiet street scene."
+
+
+def test_combine_visual_context_strips_whitespace():
+    result = _combine_visual_context("  Some description.  ", "   ")
+    assert result == "Some description."
+
+
+# --- _encode_frame_as_data_url ---
+
+
+def test_encode_frame_as_data_url_produces_valid_data_url():
+    frame_dir, paths = _fake_frame_dir(1)
+    try:
+        url = _encode_frame_as_data_url(paths[0])
+        assert url.startswith("data:image/jpeg;base64,")
+    finally:
+        for p in paths:
+            os.unlink(p)
+        os.rmdir(frame_dir)
+
+
+# --- analyze_frames ---
+
+
+@patch("app.ingestion.video_path._analyze_frames_with_vision")
+@patch("app.ingestion.video_path._extract_frames_sync")
+async def test_analyze_frames_success(mock_extract, mock_analyze):
+    frame_dir, paths = _fake_frame_dir(3)
+    mock_extract.return_value = (frame_dir, paths)
+    mock_analyze.return_value = _vision_analysis("A stat overlay on a blue background.", "SALES UP 47 PERCENT")
+
+    result = await analyze_frames("/tmp/fake_video.mp4")
+
+    assert result == "A stat overlay on a blue background.\n\nOn-screen text: SALES UP 47 PERCENT"
+    # Frames must be cleaned up after a successful analysis too.
+    assert not Path(frame_dir).exists()
+
+
+@patch("app.ingestion.video_path._extract_frames_sync")
+async def test_analyze_frames_handles_extraction_failure_gracefully(mock_extract):
+    mock_extract.side_effect = RuntimeError("ffmpeg exploded")
+    assert await analyze_frames("/tmp/fake_video.mp4") is None
+
+
+@patch("app.ingestion.video_path._extract_frames_sync")
+async def test_analyze_frames_handles_zero_frames_extracted(mock_extract):
+    frame_dir = tempfile.mkdtemp(prefix="test_frames_empty_")
+    mock_extract.return_value = (frame_dir, [])
+
+    assert await analyze_frames("/tmp/fake_video.mp4") is None
+    assert not Path(frame_dir).exists()
+
+
+@patch("app.ingestion.video_path._analyze_frames_with_vision")
+@patch("app.ingestion.video_path._extract_frames_sync")
+async def test_analyze_frames_handles_vision_failure_gracefully(mock_extract, mock_analyze):
+    frame_dir, paths = _fake_frame_dir(2)
+    mock_extract.return_value = (frame_dir, paths)
+    mock_analyze.side_effect = RuntimeError("vision API down")
+
+    result = await analyze_frames("/tmp/fake_video.mp4")
+
+    assert result is None
+    # Even on failure, extracted frames must still be cleaned up.
+    assert not Path(frame_dir).exists()
+
+
+@patch("app.ingestion.video_path._analyze_frames_with_vision")
+@patch("app.ingestion.video_path._extract_frames_sync")
+async def test_analyze_frames_passes_only_selected_frames_to_vision(mock_extract, mock_analyze):
+    frame_dir, paths = _fake_frame_dir(50)
+    mock_extract.return_value = (frame_dir, paths)
+    mock_analyze.return_value = _vision_analysis("Some scene.")
+
+    await analyze_frames("/tmp/fake_video.mp4")
+
+    sent_frames = mock_analyze.call_args.args[0]
+    assert len(sent_frames) <= MAX_FRAMES_TO_SEND
