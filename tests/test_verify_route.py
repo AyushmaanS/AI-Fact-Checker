@@ -1,14 +1,18 @@
+import io
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from fastapi import UploadFile
 from fastapi.testclient import TestClient
 
 from app.agents.verdict_agent import NO_SOURCES_RATIONALE
 from app.config import FASTROUTER_API_KEY, SUPABASE_KEY, SUPABASE_URL, TAVILY_API_KEY
 from app.main import app
 from app.models.schemas import Claim, ContentIntent, EvidenceLine, Verdict
+from app.routes.verify import UPLOAD_PLACEHOLDER_MESSAGE, _build_upload_content, _save_upload_to_temp
 
 client = TestClient(app)
 
@@ -101,6 +105,69 @@ def test_verdict_persisted_with_correct_db_claim_id_mapping(
     mock_insert_verdict.assert_called_once()
     _, kwargs = mock_insert_verdict.call_args
     assert kwargs["claim_id"] == "db-uuid-xyz"  # not the pipeline id "c1"
+
+
+# --- Sprint 13: upload endpoint + caption path ---
+
+
+async def test_save_upload_to_temp_writes_a_real_file():
+    fake_bytes = b"fake video bytes, not a real mp4"
+    upload = UploadFile(filename="clip.mp4", file=io.BytesIO(fake_bytes))
+
+    saved_path = await _save_upload_to_temp(upload)
+    try:
+        assert Path(saved_path).exists()
+        assert Path(saved_path).read_bytes() == fake_bytes
+        assert saved_path.endswith(".mp4")
+    finally:
+        Path(saved_path).unlink(missing_ok=True)
+
+
+def test_build_upload_content_populates_caption_and_topics():
+    content = _build_upload_content("Big news! #factcheck #BreakingNews https://example.com/article")
+
+    assert content.caption == "Big news! #factcheck #BreakingNews https://example.com/article"
+    assert content.topics == ["factcheck", "BreakingNews", "https://example.com/article"]
+    assert content.media_type == "video"
+    assert content.transcript is None
+
+
+def test_build_upload_content_handles_no_caption():
+    content = _build_upload_content("")
+    assert content.caption == ""
+    assert content.topics == []
+
+
+@patch("app.routes.verify.insert_submission")
+def test_verify_upload_endpoint_end_to_end(mock_insert_submission):
+    mock_insert_submission.return_value = {"id": "sub-upload-1"}
+
+    response = client.post(
+        "/verify/upload",
+        files={"file": ("clip.mp4", b"fake video bytes", "video/mp4")},
+        data={"caption": "Huge story! #factcheck"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["submission_id"] == "sub-upload-1"
+    assert body["claims"] == []
+    assert body["verdicts"] == []
+    assert body["message"] == UPLOAD_PLACEHOLDER_MESSAGE
+
+    _, kwargs = mock_insert_submission.call_args
+    assert kwargs["raw_input"] == "Huge story! #factcheck"
+    assert kwargs["input_type"] == "video_upload"
+
+
+@patch("app.routes.verify.insert_submission")
+def test_verify_upload_endpoint_without_caption(mock_insert_submission):
+    mock_insert_submission.return_value = {"id": "sub-upload-2"}
+
+    response = client.post("/verify/upload", files={"file": ("clip.mp4", b"bytes", "video/mp4")})
+
+    assert response.status_code == 200
+    assert response.json()["claims"] == []
 
 
 @LIVE_SKIP

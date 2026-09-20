@@ -12,7 +12,7 @@ and those diverge.
 ## 1. What's implemented
 
 **Phase 1 (Sprints 0–11): done.** Phase 2 (Sprints 12–18, video/image ingestion):
-**started** — Sprint 12 done, 13–18 not started.
+**started** — Sprints 12–13 done, 14–18 not started.
 
 | Sprint | What it built |
 |---|---|
@@ -29,6 +29,7 @@ and those diverge.
 | 10 | Response Formatter + full pipeline wiring (`POST /verify`) (updated once since — see §9) |
 | 11 | Eval set (22 hand-written cases) + `eval/run_eval.py` |
 | 12 | `StructuredContentObject` model + `app/ingestion/url_resolver.py` (Phase 2 start) |
+| 13 | `app/ingestion/caption_path.py` + `POST /verify/upload` (ingestion only — see §9) |
 
 Plus 4 retrofits not tied to a sprint number, each shipped after the sprint that
 introduced the thing it replaced, each verified live before landing (details in §9):
@@ -43,6 +44,15 @@ Sprint 13 (`POST /verify/upload`) doesn't call it either per its own prompt (tha
 sprint is about the caption path + upload endpoint, not URL handling); the
 resolver's first real caller is likely whichever future sprint adds
 `POST /verify/url`.
+
+**`POST /verify/upload` ingests but does not fact-check yet, by design (per
+Sprint 13's own prompt).** It saves the upload to a temp file, builds a
+`StructuredContentObject` from the caption (via `caption_path.extract_caption_content`),
+persists a `submissions` row, and returns a `VerifyResponse` with `claims: []`,
+`verdicts: []`, and an explanatory `message` — it does **not** run the
+`StructuredContentObject` through the Phase 1 pipeline yet. `transcript` is always
+`None` (no downloader/transcription until Sprint 14+). See §9 for how this
+compares to functional-spec §B.4's eventual full contract.
 
 ---
 
@@ -186,7 +196,8 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 | `GET /health` | ✅ implemented |
 | `POST /verify` | ✅ implemented (the only real endpoint) |
 | `GET /verdicts/{submission_id}` | ❌ **not implemented** — speced in functional-spec §A.4, deliberately out of Sprint 10's scope |
-| `POST /verify/upload`, `POST /verify/url` | Phase 2, not started |
+| `POST /verify/upload` | ✅ implemented, ingestion-only (Sprint 13) — accepts a video + optional caption, saves it, returns an explanatory message instead of a real verdict; see §1 |
+| `POST /verify/url` | Phase 2, not started |
 
 ---
 
@@ -249,16 +260,19 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 
 ## 8. Test / eval status
 
-**69 tests collected** across 13 test files (`test_main`, `test_schemas`,
+**79 tests collected** across 14 test files (`test_main`, `test_schemas`,
 `test_db`, `test_intent_classifier`, `test_claim_extractor`, `test_research_agent`,
 `test_evidence_ranker`, `test_analyst_agent`, `test_verdict_agent`,
-`test_citation_verifier`, `test_verify_route`, `test_pipeline`, `test_url_resolver`).
-The 10 `test_url_resolver` tests are Sprint 12's, all deterministic (no network,
-no live-key gating — see §3 for why). **All pass**, including every live test
+`test_citation_verifier`, `test_verify_route`, `test_pipeline`, `test_url_resolver`,
+`test_caption_path`). The 10 `test_url_resolver` tests are Sprint 12's, and 5 more
+in `test_caption_path` plus 5 upload-endpoint tests added to `test_verify_route`
+are Sprint 13's — all 20 deterministic, no network, no live-key gating. **All
+pass**, including every live test
 (needs `FASTROUTER_API_KEY` / `TAVILY_API_KEY` / Supabase creds) — confirmed via
 two full consecutive runs after retrofit 4, the second one clean, plus the
-non-live subset (64 tests) confirmed again clean after Sprint 12. One live test's
-own expectation had to be fixed along the way, during retrofit 4: the old
+non-live subset (74 tests) confirmed clean again after Sprints 12 and 13, most
+recently 74 passed / 5 deselected. One live test's own expectation had to be
+fixed along the way, during retrofit 4: the old
 "per-URL" citation removal test asserted a shared citation gets fully wiped when
 any one of its lines fails; that's no longer correct under the new fine-grained
 per-`EvidenceLine` removal (§3), so the assertion was corrected and a deterministic
@@ -340,3 +354,18 @@ full... and confirm no regressions") — retrofit 4 is now fully complete.
   both the original and pre-authorized backup keys; project owner supplied a third
   key to unblock it (see §6). Rerun then completed at 17/22 (77%), no regression —
   see §8.
+- **Sprint 12:** `python-multipart` wasn't in `requirements.txt` despite being
+  required for any FastAPI `File`/`Form`/`UploadFile` endpoint — not needed until
+  Sprint 13 actually added one, discovered and fixed then (installed + pinned).
+- **Sprint 13:** `POST /verify/upload` does not run the ingested content through
+  the Phase 1 pipeline, unlike functional-spec §B.4's eventual full contract
+  ("runs ingestion, then the full Phase 1 pipeline" → real `VerifyResponse` with
+  claims/verdicts). This matches Sprint 13's own prompt, which explicitly scopes
+  this sprint to "for now... just wires the caption straight into a
+  StructuredContentObject... as a placeholder" — the DoD only checks that object's
+  fields, not a real verdict. The response is still a `VerifyResponse` (keeping
+  §B.4's response *type* contract), just with empty `claims`/`verdicts` and an
+  explanatory `message`, reusing the same mechanism Sprint 10 built for the
+  non-factual-intent/zero-claim short circuits. No sprint has yet specified when
+  `StructuredContentObject` actually gets handed to the Phase 1 engine (spec §B.1
+  step 6 describes this as the eventual end state, not tied to a sprint number).
