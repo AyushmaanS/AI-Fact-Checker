@@ -179,7 +179,7 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 | Var | Used by | Status |
 |---|---|---|
 | `FASTROUTER_API_KEY` | all LLM calls | active |
-| `TAVILY_API_KEY` | research_agent | **currently on the backup key, and that key is now ALSO quota-exhausted** (`ForbiddenError: This request exceeds your plan's set usage limit`, hit 2026-09-20 running the Sprint 11 eval rerun) — see §7/§8. No further pre-authorized backup key exists. |
+| `TAVILY_API_KEY` | research_agent | active (on a third key as of 2026-09-20 — both the original and the one pre-authorized backup hit `ForbiddenError: usage limit` during this session; project owner supplied a new key to unblock the eval rerun in §8) |
 | `SUPABASE_URL` / `SUPABASE_KEY` | db/client.py | active |
 | `OPENAI_API_KEY` | — | **present in `.env.example` but unused** — no code path calls OpenAI directly; reserved for Whisper transcription once Phase 2 starts, may or may not still be needed depending on whether FastRouter proxies audio endpoints (never checked) |
 
@@ -187,21 +187,14 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 
 ## 7. Known bugs / tech debt
 
-- **Tavily quota exhausted on both keys (new, blocking, 2026-09-20).** The original
-  key hit its plan limit during Sprint 11; the one pre-authorized backup key has now
-  also hit its limit, surfaced while re-running the Sprint 11 eval set after retrofit
-  4. No code path handles this gracefully (see the next bullet) and no further
-  backup key is available — needs a decision from the project owner (new key, wait
-  for reset, or upgrade plan) before `eval/run_eval.py` or any live Tavily-dependent
-  test can run again.
 - **No per-claim error isolation in `pipeline.process_claims`, still true.**
   `_process_one_claim` no longer wraps anything in a try/except at all (`produce_verdict`
   itself no longer raises, so there was nothing left there to catch) — but that
   never covered this gap anyway. Any exception from `research_claim`,
   `rank_evidence`, `analyze_evidence`, or `verify_citations` still propagates out of
   `asyncio.gather` and kills the *entire* concurrent batch, not just the one claim.
-  This is exactly what the Tavily quota error above did to the eval rerun — the
-  very first `ForbiddenError` in the first batch took down all 22 cases at once,
+  Confirmed live during this session: a Tavily `ForbiddenError` (quota exhaustion,
+  since resolved — see §6) in the first batch took down all 22 eval cases at once,
   with zero of the other 21 claims' results recoverable. `research_agent.py` is
   explicitly off-limits to modify per current instructions, so this is unresolved.
 - **Residual audit false-positives (same underlying limitation, smaller blast
@@ -214,13 +207,26 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
   ever audited per verdict now, versus potentially several `connective_reasoning`
   segments before, so there are fewer chances to trip it — and when it does fire,
   the fallback no longer discards the real evidence/citations, only the closing
-  sentence.
-- **MISLEADING vs FALSE calibration, OUTDATED vs FALSE ambiguity:** both open
-  questions carried over from the prior design's eval runs (absolute/totalizing
-  claims skewing FALSE over MISLEADING; genuine taxonomy-boundary overlap on
-  "was X, now isn't" claims). Not re-confirmed against retrofit 4's actual output
-  yet — the eval rerun needed to check this is exactly what's blocked by the Tavily
-  quota issue above.
+  sentence. Not directly implicated in any of the post-retrofit-4 eval failures
+  (§8) — all 5 were clean label disagreements, not audit-fallback UNVERIFIABLEs.
+- **MISLEADING vs FALSE calibration — confirmed still present post-retrofit-4.**
+  The model consistently prefers a clean FALSE over MISLEADING for absolute/
+  totalizing claims ("entirely," "completely"). Re-confirmed by the same two eval
+  cases as before the retrofit (Ming Dynasty Great Wall, "bats are completely
+  blind" — see §8): both failed the exact same way under the new design. Likely an
+  eval ground-truth-strictness question, not a code bug — the label itself is a
+  judgment call, and the pipeline mechanism produced a clean, well-formed verdict
+  in both cases.
+- **OUTDATED vs FALSE ambiguity:** genuine taxonomy-boundary overlap (the Pluto
+  eval case, which passed this run) — not a bug, inherent taxonomy fuzziness.
+- **New, single-instance observation (not yet a confirmed pattern):** a claim
+  about an inherently unverifiable private document ("a private letter... never
+  publicly released...") got FALSE instead of the expected UNVERIFIABLE — see §8.
+  Plausibly the model treating strong indirect/circumstantial evidence (e.g. Van
+  Gogh's well-documented extensive use of yellow) as sufficient to contradict the
+  claim, rather than recognizing that no public source could confirm or deny a
+  private, unpublished document either way. One data point; worth watching on
+  future eval runs before treating as a real pattern.
 - **`GET /verdicts/{submission_id}`** not implemented (see §5).
 
 ---
@@ -241,15 +247,25 @@ regression test for the same "shared URL, one valid line" case was added
 (`test_shared_citation_url_survives_if_one_of_its_lines_is_valid`) — not a code bug,
 a stale test expectation caught by live testing doing exactly its job.
 
-**`eval/run_eval.py`: not yet re-run to completion post-retrofit-4.** The rerun was
-started and immediately hit the Tavily quota exhaustion described in §6/§7 on the
-very first batch — zero cases completed, not a partial or degraded result. The prior
-design's baseline (22 hand-written cases spanning all 7 labels) ranged **64–73%**
-pass rate across multiple runs on stable code; that baseline is what retrofit 4
-still needs to be checked against once Tavily access is restored. This is the one
-piece of the user's explicit retrofit-4 request ("re-run the eval set in full... and
-confirm no regressions") not yet completed — everything else (all 7 files rebuilt,
-all tests updated/passing, docs updated) is done.
+**`eval/run_eval.py` post-retrofit-4: 17/22 (77%), 63.7s total** — above the prior
+design's 64–73% range, so no regression (this single run is also each design's
+best recorded pass rate so far; not enough runs post-retrofit to know if 77% is
+the new typical or a good roll — LLM output variance applies here same as before).
+None of the 5 failures show the audit-fallback signature (UNVERIFIABLE + the canned
+`AUDIT_FALLBACK_SUMMARY` text) — every case got a clean, well-formed label from the
+pipeline; all 5 mismatches are the model's label choice disagreeing with the eval's
+ground truth, not a pipeline/mechanism defect. Failures:
+
+| Claim | Expected | Actual | Note |
+|---|---|---|---|
+| "Water boils at 100 degrees Celsius at sea level atmospheric pressure." | TRUE | MISLEADING | New. Claim already correctly qualifies itself; model likely over-weighted boiling-point-varies-with-altitude context despite the qualifier. |
+| "The Statue of Liberty was a gift from the French government to the United States government to celebrate American independence." | PARTIALLY_TRUE | TRUE | New. Eval expects the French-public-subscription-vs-government nuance to be caught; evidence gathered apparently didn't surface it strongly enough. |
+| "The Great Wall of China was built entirely during the Ming Dynasty." | MISLEADING | FALSE | Same case, same failure, as the pre-retrofit design (§7 calibration note). |
+| "Bats are completely blind." | MISLEADING | FALSE | Same case, same failure, as the pre-retrofit design (§7 calibration note). |
+| "A private letter written by Vincent van Gogh in 1881, never publicly released, mentions his fear of the color yellow." | UNVERIFIABLE | FALSE | New. See §7's single-instance observation. |
+
+This satisfies the user's explicit retrofit-4 request ("re-run the eval set in
+full... and confirm no regressions") — retrofit 4 is now fully complete.
 
 ---
 
@@ -301,5 +317,7 @@ all tests updated/passing, docs updated) is done.
   real, necessary change to `routes/verify.py` was renaming the import/call from
   `join_rationale_segments` to `format_verdict_text` to match the Response
   Formatter's new API.
-- **Today (2026-09-20):** eval rerun blocked on Tavily quota exhaustion on both the
-  original and backup keys — see §6/§7/§8.
+- **Today (2026-09-20):** eval rerun briefly blocked on Tavily quota exhaustion on
+  both the original and pre-authorized backup keys; project owner supplied a third
+  key to unblock it (see §6). Rerun then completed at 17/22 (77%), no regression —
+  see §8.
