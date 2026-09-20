@@ -12,8 +12,7 @@ and those diverge.
 ## 1. What's implemented
 
 **Phase 1 (Sprints 0–11): done.** Phase 2 (Sprints 12–18, video/image ingestion):
-**not started** — `app/ingestion/` is an empty package stub from Sprint 0 scaffolding
-only.
+**started** — Sprint 12 done, 13–18 not started.
 
 | Sprint | What it built |
 |---|---|
@@ -29,6 +28,7 @@ only.
 | 9 | Citation Verifier (updated once since — see §9) |
 | 10 | Response Formatter + full pipeline wiring (`POST /verify`) (updated once since — see §9) |
 | 11 | Eval set (22 hand-written cases) + `eval/run_eval.py` |
+| 12 | `StructuredContentObject` model + `app/ingestion/url_resolver.py` (Phase 2 start) |
 
 Plus 4 retrofits not tied to a sprint number, each shipped after the sprint that
 introduced the thing it replaced, each verified live before landing (details in §9):
@@ -36,6 +36,13 @@ introduced the thing it replaced, each verified live before landing (details in 
 2. Free-text rationale + heuristic-only validator → two-stage validator (heuristic + LLM semantic check)
 3. Two-stage validator → structured self-declared `RationaleSegment`s
 4. Structured segments → **evidence lines + one audited summary line** (current — see §2/§3)
+
+**Sprint 12 is a standalone utility, not wired into a route yet** —
+`app/ingestion/url_resolver.py`'s `resolve_url()` has no caller in the codebase.
+Sprint 13 (`POST /verify/upload`) doesn't call it either per its own prompt (that
+sprint is about the caption path + upload endpoint, not URL handling); the
+resolver's first real caller is likely whichever future sprint adds
+`POST /verify/url`.
 
 ---
 
@@ -139,6 +146,15 @@ retrofit 4 except removing a now-dead try/except, see §9), `routes/verify.py`
   `aggregate_label` is meant to hold a verdict label, not free text.
 - **LLM client timeout: 60s**, not the OpenAI SDK's 600s default (found live, prior
   retrofit).
+- **URL Resolver (Sprint 12) skips the network entirely for a URL whose domain is
+  already a recognized platform** (currently just `instagram.com`/`instagr.am`) —
+  only strips tracking params. Confirmed live: an unauthenticated HEAD to a
+  made-up Instagram reel URL 200s with the same URL back (no block, no redirect,
+  since the real content loads client-side) — so a live fetch there wouldn't add
+  information anyway, unlike a genuine shortlink domain, which does get a
+  best-effort redirect-follow (`_follow_redirects`, graceful fallback to the
+  original URL on any failure — same "can't check, not a failure" stance as
+  Citation Verifier).
 
 ---
 
@@ -233,13 +249,16 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 
 ## 8. Test / eval status
 
-**59 tests collected** across 12 test files (`test_main`, `test_schemas`,
+**69 tests collected** across 13 test files (`test_main`, `test_schemas`,
 `test_db`, `test_intent_classifier`, `test_claim_extractor`, `test_research_agent`,
 `test_evidence_ranker`, `test_analyst_agent`, `test_verdict_agent`,
-`test_citation_verifier`, `test_verify_route`, `test_pipeline`). **All 59 pass**,
-including every live test (needs `FASTROUTER_API_KEY` / `TAVILY_API_KEY` / Supabase
-creds) — confirmed via two full consecutive runs after retrofit 4, the second one
-clean. One live test's own expectation had to be fixed along the way: the old
+`test_citation_verifier`, `test_verify_route`, `test_pipeline`, `test_url_resolver`).
+The 10 `test_url_resolver` tests are Sprint 12's, all deterministic (no network,
+no live-key gating — see §3 for why). **All pass**, including every live test
+(needs `FASTROUTER_API_KEY` / `TAVILY_API_KEY` / Supabase creds) — confirmed via
+two full consecutive runs after retrofit 4, the second one clean, plus the
+non-live subset (64 tests) confirmed again clean after Sprint 12. One live test's
+own expectation had to be fixed along the way, during retrofit 4: the old
 "per-URL" citation removal test asserted a shared citation gets fully wiped when
 any one of its lines fails; that's no longer correct under the new fine-grained
 per-`EvidenceLine` removal (§3), so the assertion was corrected and a deterministic

@@ -89,3 +89,14 @@ class VerifyResponse(BaseModel):
     # somewhere to put their canned explanation without overloading
     # aggregate_label, which is meant to hold a verdict label, not free text.
     message: Optional[str] = None
+
+
+class StructuredContentObject(BaseModel):
+    transcript: Optional[str] = None
+    visual_context: Optional[str] = None  # GPT-4o Vision frame description + OCR text
+    caption: Optional[str] = None
+    source_url: Optional[str] = None
+    topics: list[str] = []
+    language: str = "en"
+    media_type: Literal["video", "image", "text_post"]
+    low_confidence_transcript: bool = False  # true if Whisper confidence < 0.6
