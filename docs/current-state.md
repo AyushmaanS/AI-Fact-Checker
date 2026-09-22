@@ -1,5 +1,5 @@
 # Current State
-**Last updated:** 2026-09-22 · after Sprint 18 (all 18 current-plan sprints done) + 4 Phase-1 retrofits · commit `9b54a16`
+**Last updated:** 2026-09-22 · after Sprint 18 (all 18 current-plan sprints done) + 4 Phase-1 retrofits + Streamlit frontend · commit `4cfd2ba`
 
 Living snapshot of what's actually true in the code right now. The other docs in
 this folder (`prd-v1-draft.md`, `phase1-2-functional-spec.md`,
@@ -53,6 +53,18 @@ wired end-to-end** — every piece built across Sprints 12–17
 `video_path.transcribe_video`, and `video_path.analyze_frames`/`analyze_image`)
 now has a real caller. See §2 for the full wired pipeline and §8 for the live
 end-to-end confirmation against a real public Instagram Reel.
+
+**Not tied to a sprint number: a Streamlit frontend (`frontend/`).** Built after
+Sprint 18, requested directly rather than from the sprint plan. `frontend/api_client.py`
+is a thin `requests` wrapper around the three `/verify*` endpoints;
+`frontend/streamlit_app.py` is the UI (text/URL/upload tabs, colored verdict
+badges, confidence bars, a supporting/contradicting evidence breakdown per
+claim). No backend changes - pure presentation layer, calls the API server-side
+so there's no CORS concern. Verified live end-to-end against the real running
+backend for all three tabs (zero-claims message, multi-claim aggregate badge,
+mixed TRUE/MISLEADING verdicts with evidence links, multipart upload, and a
+graceful URL-download-failure message) - see `.claude/launch.json` for the two
+dev-server configs used to run it.
 
 ---
 
@@ -391,6 +403,7 @@ queue — those remain explicitly deferred to Phase 4+.
 | `TAVILY_API_KEY` | research_agent | active (on a third key as of 2026-09-20 — both the original and the one pre-authorized backup hit `ForbiddenError: usage limit` during this session; project owner supplied a new key to unblock the eval rerun in §8) |
 | `SUPABASE_URL` / `SUPABASE_KEY` | db/client.py | active - `SUPABASE_KEY` is the `anon` role (confirmed by decoding the JWT), used for both the Postgres tables and, as of Sprint 18, the `media` Storage bucket via RLS policies rather than a `service_role` key - see §3 |
 | `OPENAI_API_KEY` | — | **present in `.env.example` but unused, confirmed not needed** — FastRouter proxies Whisper too (`app/ingestion/video_path.py`, Sprint 15), same as every other model in this codebase. No code path calls OpenAI directly. |
+| `API_BASE_URL` | `frontend/api_client.py` | active - defaults to `http://localhost:8000` if unset, so it's optional for local dev |
 
 ---
 
