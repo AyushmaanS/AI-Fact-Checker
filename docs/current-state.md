@@ -1,5 +1,5 @@
 # Current State
-**Last updated:** 2026-09-22 · after Sprint 18 (all 18 current-plan sprints done) + 4 Phase-1 retrofits + Streamlit frontend + instaloader photo-post fallback · commit `8539a4c`
+**Last updated:** 2026-09-22 · after Sprint 18 (all 18 current-plan sprints done) + 4 Phase-1 retrofits + Streamlit frontend + instaloader photo-post fallback + India-context credibility expansion · commit `e2e9191`
 
 Living snapshot of what's actually true in the code right now. The other docs in
 this folder (`prd-v1-draft.md`, `phase1-2-functional-spec.md`,
@@ -20,7 +20,7 @@ public Instagram Reel (see §8). The sprint plan's own text calls this point
 | Sprint | What it built |
 |---|---|
 | 0 | FastAPI scaffold, `GET /health`, `.env` config loading |
-| 1 | Pydantic schemas, Postgres DDL, Supabase client, seeded `source_credibility` (8 tiers, ~30 domains) |
+| 1 | Pydantic schemas, Postgres DDL, Supabase client, seeded `source_credibility` (8 tiers, ~30 domains, expanded to 67 - see below) |
 | 2 | Content Intent Classifier (`gpt-4o-mini`) |
 | 3 | Claim Extractor (`gpt-4o`) |
 | 4 | Research Agent (Tavily + query decomposer) |
@@ -97,6 +97,31 @@ post) - both now return complete, real, cited verdicts instead of an error,
 via both the API directly and the Streamlit URL tab. Not yet verified live
 against a genuine multi-image carousel (only covered by mocked tests) - both
 real URLs used for verification happened to be single-image posts.
+
+**Not tied to a sprint number: `source_credibility` expanded from ~30 to 67
+domains (Sep 2026), adding an India-context tier of sources.** Motivated by a
+real finding: a live `/verify/url` run on a Mumbai-metro-accident Reel
+selected two completely unrelated sources (an Anthropic cybersecurity blog
+post, a California wildfire-incidents page) into a verdict's evidence_lines.
+Root cause wasn't Indian-source coverage directly - it's that the pipeline
+has no relevance filter at all (see §7's new entry) - but investigating it
+surfaced that every legitimate Indian outlet in that same verdict (Indian
+Express, Times of India, Ground News, Mumbai Live) *also* fell through to the
+same 0.4 `Unclassified` default as the two garbage sources, since the
+original seed table is almost entirely Western/international domains. That
+tie is exactly what let irrelevant results win a "top 3 by credibility"
+selection slot. The 35 new rows (government/statistical bodies, IFCN-
+certified Indian fact-checkers, wire services, major English *and*
+vernacular-language newspapers) were user-researched and directly verified
+against the live `_lookup_credibility` function before landing - confirmed
+`indianexpress.com`/`timesofindia.indiatimes.com` now resolve to 0.75, bare
+`indiatimes.com` deliberately still doesn't match (it hosts unrelated
+properties), and `hi.wikipedia.org` already fuzzy-matched `wikipedia.org`
+correctly with no code change needed. Inserted directly into the live table
+via the app's own anon key - `source_credibility` is a plain table with no
+RLS (see §3), unlike the Storage bucket case, so no manual SQL-editor step
+was needed this time. `ground.news` and `mumbailive.com` specifically are
+still not covered (not in the researched list) and still default to 0.4.
 
 ---
 
@@ -388,7 +413,7 @@ submissions(id uuid pk, raw_input text, input_type text, created_at,
             extracted_text text, extracted_text_expires_at timestamptz) -- Sprint 18
 claims(id uuid pk, submission_id fk, text, topic, specificity, verifiability_score)
 verdicts(id uuid pk, claim_id fk, label, rationale text, confidence_score, citations jsonb, created_at)
-source_credibility(domain_pattern text pk, category text, weight float)  -- seeded, ~30 rows
+source_credibility(domain_pattern text pk, category text, weight float)  -- seeded, 67 rows (30 original + 35 India-context, Sep 2026)
 ```
 
 `verdicts.rationale` is still a plain `text` column — the DDL never changed. What
@@ -493,6 +518,28 @@ queue — those remain explicitly deferred to Phase 4+.
   a genuine multi-image carousel - the first-image-only logic is covered by
   mocked tests only (both real URLs used for live verification were
   single-image posts).
+- **No relevance filter anywhere in the pipeline - only a for/against
+  filter.** Confirmed live: a real claim's evidence_lines included an
+  Anthropic cybersecurity blog post and a California wildfire-incidents page,
+  neither remotely related. Traced to three compounding gaps, none of them
+  new code from this pass: (1) `research_agent.py`'s query decomposer always
+  generates a "potential counter-evidence" search query, even for claims (a
+  routine local news report) that have no genuine counter-evidence to find;
+  (2) Tavily still returns its top-5 best-effort matches for that query
+  regardless of relevance, and a generic query can surface totally unrelated
+  pages on loose keyword overlap (e.g. "incident(s)"); (3)
+  `evidence_ranker.py`'s `STANCE_SYSTEM_PROMPT` explicitly instructs
+  "neutral, tangential" evidence to default to `"for"` rather than being
+  excluded - there's no "not applicable" option in the schema at all, so the
+  model dutifully classifies obvious non-matches as supporting evidence (the
+  paraphrase for both garbage sources literally said "unrelated to the
+  claim" - the dishonesty isn't in the model, it's in the schema forcing a
+  binary choice). From there, `analyst_agent._select_top_ids` only ranks by
+  `credibility_weight`, with no relevance signal to rank on at all. Not yet
+  fixed - would need either a third stance option (e.g. "irrelevant") that
+  gets dropped before selection, or a relevance check before the stance
+  classifier runs. Touches `research_agent.py`, which the project has
+  historically treated as off-limits to modify without explicit sign-off.
 
 ---
 
