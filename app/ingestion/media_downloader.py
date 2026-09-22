@@ -7,14 +7,21 @@ from typing import Optional
 import yt_dlp
 from pydantic import BaseModel
 
+from app.ingestion.photo_post_downloader import download_photo_post
+
 logger = logging.getLogger(__name__)
 
 DOWNLOAD_FAILED_TEXT = "Could not download this content."
-# Set instead of DOWNLOAD_FAILED_TEXT when yt-dlp's own error makes clear the
-# post has no video at all (a photo post/carousel) rather than being private,
-# deleted, or rate-limited - see instagram.py's raise_no_formats call, which
-# discards the caption it already fetched instead of returning it.
-NO_VIDEO_ERROR = "no_video_in_post"
+# Set when yt-dlp reports no video AND the instaloader fallback below also
+# couldn't get the photo - distinct from DOWNLOAD_FAILED_TEXT so verify.py can
+# give a more specific message than "private/deleted/rate-limited", which
+# isn't what happened here.
+PHOTO_POST_FALLBACK_FAILED_ERROR = "photo_post_fallback_failed"
+# yt-dlp's own error text when a post has no video at all (a photo post) -
+# it parses the caption internally but discards it before returning, once it
+# sees there are no video formats (see instagram.py's raise_no_formats call) -
+# so unlike a real rate-limit/private-post failure, retrying the metadata-only
+# attempt is pointless here; the instaloader fallback is tried instead.
 _NO_VIDEO_MARKER = "no video in this post"
 
 _YDL_OPTS_BASE = {
@@ -49,17 +56,29 @@ def _is_no_video_error(exc: Exception) -> bool:
     return _NO_VIDEO_MARKER in str(exc).lower()
 
 
+async def _try_photo_post_fallback(url: str) -> DownloadResult:
+    try:
+        result = await download_photo_post(url)
+    except Exception as exc:
+        logger.info("media_downloader: photo-post fallback also failed for %s (%s)", url, exc)
+        return DownloadResult(success=False, error=PHOTO_POST_FALLBACK_FAILED_ERROR)
+    return DownloadResult(success=True, file_path=result.image_path, caption=result.caption)
+
+
 async def download_media(url: str) -> DownloadResult:
     """Downloads a video via yt-dlp into a fresh temp directory. Never raises -
     a private/deleted/rate-limited post is a normal, expected outcome here, not
     an exceptional one (spec B.5: "graceful caption-only fallback or a clear
-    user-facing error, never a raw stack trace"). If the full download fails,
-    makes one more attempt at metadata only (no download) - some failure modes
-    (e.g. a rate limit that only affects the media CDN) still leave the post's
-    own caption/description reachable even when the video itself isn't, and
-    that's exactly what the caption-only fallback needs."""
+    user-facing error, never a raw stack trace"). If the full download fails
+    with yt-dlp's specific "no video in this post" error, the post has no video
+    at all (a photo post) - falls straight to the instaloader-based photo-post
+    fallback rather than yt-dlp's own metadata-only retry, which would just
+    fail the same way again. Any other failure makes one more attempt at
+    metadata only (no download) - some failure modes (e.g. a rate limit that
+    only affects the media CDN) still leave the post's own caption/description
+    reachable even when the video itself isn't, and that's exactly what the
+    caption-only fallback needs."""
     temp_dir = tempfile.mkdtemp(prefix="ingest_")
-    error = DOWNLOAD_FAILED_TEXT
 
     try:
         info = await asyncio.to_thread(_extract_sync, url, True, temp_dir)
@@ -70,13 +89,11 @@ async def download_media(url: str) -> DownloadResult:
     except Exception as exc:
         logger.info("media_downloader: full download failed for %s (%s)", url, exc)
         if _is_no_video_error(exc):
-            error = NO_VIDEO_ERROR
+            return await _try_photo_post_fallback(url)
 
     try:
         info = await asyncio.to_thread(_extract_sync, url, False, temp_dir)
-        return DownloadResult(success=False, caption=info.get("description"), error=error)
+        return DownloadResult(success=False, caption=info.get("description"), error=DOWNLOAD_FAILED_TEXT)
     except Exception as exc:
         logger.info("media_downloader: metadata-only fetch also failed for %s (%s)", url, exc)
-        if _is_no_video_error(exc):
-            error = NO_VIDEO_ERROR
-        return DownloadResult(success=False, error=error)
+        return DownloadResult(success=False, error=DOWNLOAD_FAILED_TEXT)

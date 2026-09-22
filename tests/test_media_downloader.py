@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
-from app.ingestion.media_downloader import DOWNLOAD_FAILED_TEXT, NO_VIDEO_ERROR, download_media
+from app.ingestion.media_downloader import DOWNLOAD_FAILED_TEXT, PHOTO_POST_FALLBACK_FAILED_ERROR, download_media
+from app.ingestion.photo_post_downloader import PhotoPostResult
 
 
 @patch("app.ingestion.media_downloader._find_downloaded_file")
@@ -55,20 +56,61 @@ async def test_download_media_reports_clean_failure_when_both_attempts_fail(mock
     assert mock_extract.call_count == 2
 
 
+@patch("app.ingestion.media_downloader.download_photo_post")
 @patch("app.ingestion.media_downloader._extract_sync")
-async def test_download_media_detects_photo_post_with_no_video(mock_extract):
-    # A photo post/carousel, not a Reel - yt-dlp's Instagram extractor raises
-    # this exact, stable error on both the download and metadata-only attempts
-    # (it parses the caption internally but discards it before returning, once
-    # it sees there are no video formats - see instagram.py's raise_no_formats
-    # call). Confirmed live: two real photo-post URLs hit this verbatim.
+async def test_download_media_falls_back_to_instaloader_on_no_video_error(mock_extract, mock_download_photo):
+    # A photo post, not a Reel - yt-dlp's Instagram extractor raises this
+    # exact, stable error (it parses the caption internally but discards it
+    # before returning, once it sees there are no video formats - see
+    # instagram.py's raise_no_formats call). Confirmed live: two real
+    # photo-post URLs hit this verbatim. Only one yt-dlp call should happen -
+    # retrying yt-dlp's own metadata-only path would just fail the same way
+    # again, so it goes straight to the instaloader fallback instead.
     mock_extract.side_effect = RuntimeError("[Instagram] abc123: There is no video in this post")
+    mock_download_photo.return_value = PhotoPostResult(
+        image_path="/tmp/photo_xyz/abc123.jpg", caption="A real photo caption", hashtags=["news"]
+    )
+
+    result = await download_media("https://www.instagram.com/p/abc123/")
+
+    assert result.success is True
+    assert result.file_path == "/tmp/photo_xyz/abc123.jpg"
+    assert result.caption == "A real photo caption"
+    mock_download_photo.assert_called_once_with("https://www.instagram.com/p/abc123/")
+    assert mock_extract.call_count == 1
+
+
+@patch("app.ingestion.media_downloader.download_photo_post")
+@patch("app.ingestion.media_downloader._extract_sync")
+async def test_download_media_reports_specific_error_when_instaloader_fallback_also_fails(
+    mock_extract, mock_download_photo
+):
+    mock_extract.side_effect = RuntimeError("[Instagram] abc123: There is no video in this post")
+    mock_download_photo.side_effect = RuntimeError("Instaloader: 401 Unauthorized")
 
     result = await download_media("https://www.instagram.com/p/abc123/")
 
     assert result.success is False
+    assert result.file_path is None
     assert result.caption is None
-    assert result.error == NO_VIDEO_ERROR
+    assert result.error == PHOTO_POST_FALLBACK_FAILED_ERROR
+
+
+@patch("app.ingestion.media_downloader.download_photo_post")
+@patch("app.ingestion.media_downloader._extract_sync")
+async def test_download_media_does_not_fall_back_to_instaloader_for_other_errors(
+    mock_extract, mock_download_photo
+):
+    # A genuinely private/deleted/rate-limited post - a completely different
+    # yt-dlp error, so the instaloader fallback must not be tried; existing
+    # caption-only-retry behavior stays exactly as it was.
+    mock_extract.side_effect = RuntimeError("Private video")
+
+    result = await download_media("https://www.instagram.com/reel/private-post/")
+
+    assert result.success is False
+    assert result.error == DOWNLOAD_FAILED_TEXT
+    mock_download_photo.assert_not_called()
     assert mock_extract.call_count == 2
 
 

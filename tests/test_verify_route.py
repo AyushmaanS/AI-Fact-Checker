@@ -11,14 +11,14 @@ from fastapi.testclient import TestClient
 
 from app.agents.verdict_agent import NO_SOURCES_RATIONALE
 from app.config import FASTROUTER_API_KEY, SUPABASE_KEY, SUPABASE_URL, TAVILY_API_KEY
-from app.ingestion.media_downloader import NO_VIDEO_ERROR, DownloadResult
+from app.ingestion.media_downloader import PHOTO_POST_FALLBACK_FAILED_ERROR, DownloadResult
 from app.ingestion.url_resolver import ResolvedURL
 from app.main import app
 from app.models.schemas import Claim, ContentIntent, EvidenceLine, StructuredContentObject, Verdict
 from app.routes.verify import (
     NO_EXTRACTABLE_CONTENT_MESSAGE,
     URL_DOWNLOAD_FAILED_MESSAGE,
-    URL_NO_VIDEO_MESSAGE,
+    URL_PHOTO_POST_FALLBACK_FAILED_MESSAGE,
     _combine_content_for_pipeline,
     _save_upload_to_temp,
 )
@@ -360,17 +360,19 @@ def test_verify_url_clean_failure_when_nothing_is_reachable(
 @patch("app.routes.verify.insert_submission")
 @patch("app.routes.verify.download_media")
 @patch("app.routes.verify.resolve_url")
-def test_verify_url_photo_post_gets_specific_message(
+def test_verify_url_photo_post_fallback_failure_gets_specific_message(
     mock_resolve, mock_download, mock_insert_submission, mock_cleanup
 ):
-    # A photo post, not a Reel - yt-dlp can't extract anything from it (see
-    # media_downloader's NO_VIDEO_ERROR), so this should get the specific
-    # "this looks like a photo post" message, not the generic
-    # private/deleted/rate-limited one.
+    # A photo post where the instaloader fallback also failed (see
+    # media_downloader.PHOTO_POST_FALLBACK_FAILED_ERROR) - should get the
+    # specific "we tried to fetch it directly but that also failed" message,
+    # not the generic private/deleted/rate-limited one.
     mock_resolve.return_value = ResolvedURL(
         canonical_url="https://www.instagram.com/p/photo-post/", platform="instagram"
     )
-    mock_download.return_value = DownloadResult(success=False, caption=None, error=NO_VIDEO_ERROR)
+    mock_download.return_value = DownloadResult(
+        success=False, caption=None, error=PHOTO_POST_FALLBACK_FAILED_ERROR
+    )
     mock_insert_submission.return_value = {"id": "sub-url-4"}
 
     response = client.post("/verify/url", json={"url": "https://www.instagram.com/p/photo-post/"})
@@ -378,7 +380,7 @@ def test_verify_url_photo_post_gets_specific_message(
     assert response.status_code == 200
     body = response.json()
     assert body["claims"] == []
-    assert body["message"] == URL_NO_VIDEO_MESSAGE
+    assert body["message"] == URL_PHOTO_POST_FALLBACK_FAILED_MESSAGE
 
 
 @LIVE_SKIP
