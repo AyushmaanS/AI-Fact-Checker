@@ -1,5 +1,5 @@
 # Current State
-**Last updated:** 2026-09-22 · after Sprint 18 (all 18 current-plan sprints done) + 4 Phase-1 retrofits + Streamlit frontend + photo-post message fix · commit `4b463b7`
+**Last updated:** 2026-09-22 · after Sprint 18 (all 18 current-plan sprints done) + 4 Phase-1 retrofits + Streamlit frontend + instaloader photo-post fallback · commit `6451b5d`
 
 Living snapshot of what's actually true in the code right now. The other docs in
 this folder (`prd-v1-draft.md`, `phase1-2-functional-spec.md`,
@@ -65,6 +65,38 @@ backend for all three tabs (zero-claims message, multi-claim aggregate badge,
 mixed TRUE/MISLEADING verdicts with evidence links, multipart upload, and a
 graceful URL-download-failure message) - see `.claude/launch.json` for the two
 dev-server configs used to run it.
+
+**Not tied to a sprint number: `app/ingestion/photo_post_downloader.py`, an
+`instaloader`-based fallback for Instagram photo posts.** Built after the
+photo-post message fix above, once it was clear the underlying gap (yt-dlp is
+video-only, so it can't extract a photo post at all, not even the caption)
+was common enough to be worth fixing rather than just messaging around.
+`media_downloader.download_media` now catches yt-dlp's specific `"There is no
+video in this post"` error and, only for that error, calls
+`photo_post_downloader.download_photo_post` instead of retrying yt-dlp's own
+metadata-only path (confirmed pointless - it fails identically). That
+function fetches the post anonymously via `instaloader.Post.from_shortcode`
+(no login) and downloads just the one image's bytes directly - not
+`instaloader`'s own `download_post()`, which writes extra sidecar/metadata
+files this app doesn't use. A carousel (`GraphSidecar`) uses only its first
+image, logging that simplification. On success this looks like any other
+`DownloadResult` to the rest of the pipeline - it flows into the existing
+Sprint 17 media router and Sprint 16 `analyze_image()` completely unchanged,
+exactly as a directly-uploaded image would. If `instaloader` also fails
+(anonymous fetching is subject to the same kind of throttling as yt-dlp - not
+a guaranteed fix), `/verify/url` now returns a third, distinct message
+(`URL_PHOTO_POST_FALLBACK_FAILED_MESSAGE`) pointing at the upload tab as a
+workaround, rather than the generic private/deleted/rate-limited one. This
+made the earlier `NO_VIDEO_ERROR`/`URL_NO_VIDEO_MESSAGE` pair (from the
+photo-post message fix) dead code - every "no video" case now either
+succeeds via this fallback or produces the new fallback-failed message, so
+both were removed rather than left unreachable. Verified live end-to-end
+against the exact two real photo-post URLs that originally surfaced this gap
+(a National Security Advisor speech post and a Bombay High Court ruling
+post) - both now return complete, real, cited verdicts instead of an error,
+via both the API directly and the Streamlit URL tab. Not yet verified live
+against a genuine multi-image carousel (only covered by mocked tests) - both
+real URLs used for verification happened to be single-image posts.
 
 ---
 
@@ -391,7 +423,7 @@ queue — those remain explicitly deferred to Phase 4+.
 | `POST /verify` | ✅ implemented |
 | `GET /verdicts/{submission_id}` | ❌ **not implemented** — speced in functional-spec §A.4, deliberately out of Sprint 10's scope |
 | `POST /verify/upload` | ✅ **fully implemented as of Sprint 18** — accepts a video + optional caption, stores it in Supabase Storage, runs it through the full ingestion + Phase 1 pipeline, returns a real cited `VerifyResponse` (or a graceful canned message if there's nothing to check) |
-| `POST /verify/url` | ✅ **fully implemented as of Sprint 18** — resolves the URL, downloads via yt-dlp (or falls back to caption-only, or fails cleanly), same full pipeline as upload. Confirmed live end-to-end against a real public Instagram Reel — see §8. |
+| `POST /verify/url` | ✅ **fully implemented as of Sprint 18** — resolves the URL, downloads via yt-dlp (or falls back to caption-only, or - for a photo post - to `instaloader`, or fails cleanly), same full pipeline as upload. Confirmed live end-to-end against a real public Instagram Reel and two real Instagram photo posts — see §8. |
 
 ---
 
@@ -450,19 +482,17 @@ queue — those remain explicitly deferred to Phase 4+.
   private, unpublished document either way. One data point; worth watching on
   future eval runs before treating as a real pattern.
 - **`GET /verdicts/{submission_id}`** not implemented (see §5).
-- **Instagram photo posts (no video) aren't supported via URL - by design for
-  now, not a bug.** `yt-dlp`'s Instagram extractor raises `"There is no video
-  in this post"` for a photo post/carousel on both the download and
-  metadata-only attempts - it parses the caption internally but discards it
-  before returning, once it sees there are no video formats. Found live via
-  the frontend's URL tab against two real photo-post URLs, both of which had
-  been getting the generic private/deleted/rate-limited message. Fixed to
-  detect this specific error (`media_downloader.NO_VIDEO_ERROR`) and tell the
-  user it's a photo post, suggesting the text tab as a workaround, rather than
-  building actual photo-post ingestion - the pipeline already has everything
-  needed downstream for a single image (Sprint 17's `analyze_image`), the gap
-  is purely that yt-dlp can't fetch an Instagram photo at all. Revisit if this
-  turns out to be common enough to justify a non-yt-dlp extraction path.
+- **Instagram photo-post support (via the `instaloader` fallback - see §1) is
+  best-effort, not guaranteed.** Anonymous `instaloader` fetching is subject
+  to the same kind of request throttling as yt-dlp - if Instagram starts
+  rate-limiting anonymous requests harder, this fallback degrades to the
+  `URL_PHOTO_POST_FALLBACK_FAILED_MESSAGE` failure path, same as before it
+  existed. An authenticated (logged-in) `instaloader` session is a possible
+  future lever if that happens, but needs a real Instagram account and was
+  explicitly out of scope for this pass. Also not yet confirmed live against
+  a genuine multi-image carousel - the first-image-only logic is covered by
+  mocked tests only (both real URLs used for live verification were
+  single-image posts).
 
 ---
 
