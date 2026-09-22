@@ -113,3 +113,67 @@ create policy "media bucket: anon can read" on storage.objects
 create policy "media bucket: anon can delete" on storage.objects
     for delete to anon
     using (bucket_id = 'media');
+
+-- Indian-context expansion (Sep 2026): the original Sprint 1 seed above is
+-- ~30 domains, almost entirely Western/international outlets - any Indian
+-- source (including major ones like The Hindu or PTI) fell through to the
+-- 0.4 Unclassified default, indistinguishable by weight from an unrelated
+-- source a bad search query happened to surface. Same 8 tiers, same weights -
+-- purely additive rows, no reweighting of anything above. Fact-checker
+-- entries are IFCN-certified only, the same objective bar the existing
+-- snopes.com/politifact.com/fullfact.org rows imply. Deliberately excludes
+-- kooapp.com (shut down mid-2024), PIB's Fact Check Unit specifically (the
+-- rule that created it was struck down by the Bombay High Court in September
+-- 2024 - pib.gov.in is still listed below for its ordinary government
+-- press-release function), and opindia.com (rejected for IFCN certification,
+-- documented false stories). Note timesofindia.indiatimes.com is the full
+-- subdomain deliberately, not the bare indiatimes.com, which hosts several
+-- distinct properties with different editorial standards.
+insert into source_credibility (domain_pattern, category, weight) values
+    ('mohfw.gov.in', 'Primary Gov/IGO', 0.95),
+    ('icmr.gov.in', 'Primary Gov/IGO', 0.95),
+    ('rbi.org.in', 'Primary Gov/IGO', 0.95),
+    ('mospi.gov.in', 'Primary Gov/IGO', 0.95),
+    ('censusindia.gov.in', 'Primary Gov/IGO', 0.95),
+    ('eci.gov.in', 'Primary Gov/IGO', 0.95),
+    ('niti.gov.in', 'Primary Gov/IGO', 0.95),
+    ('pib.gov.in', 'Primary Gov/IGO', 0.95),
+
+    ('currentscience.ac.in', 'Peer-Reviewed Academic', 0.90),
+    ('ias.ac.in', 'Peer-Reviewed Academic', 0.90),
+
+    ('altnews.in', 'Established Fact-Checkers', 0.88),
+    ('factchecker.in', 'Established Fact-Checkers', 0.88),
+    ('boomlive.in', 'Established Fact-Checkers', 0.88),
+    ('newschecker.in', 'Established Fact-Checkers', 0.88),
+    ('vishvasnews.com', 'Established Fact-Checkers', 0.88),
+    ('factly.in', 'Established Fact-Checkers', 0.88),
+    ('dfrac.org', 'Established Fact-Checkers', 0.88),
+
+    ('ptinews.com', 'Major Wire Services', 0.82),
+    ('aninews.in', 'Major Wire Services', 0.82),
+
+    ('thehindu.com', 'Major National Newspapers', 0.75),
+    ('hindustantimes.com', 'Major National Newspapers', 0.75),
+    ('indianexpress.com', 'Major National Newspapers', 0.75),
+    ('timesofindia.indiatimes.com', 'Major National Newspapers', 0.75),
+    ('livemint.com', 'Major National Newspapers', 0.75),
+    ('business-standard.com', 'Major National Newspapers', 0.75),
+    ('dainikbhaskar.com', 'Major National Newspapers', 0.75),
+    ('jagran.com', 'Major National Newspapers', 0.75),
+    ('amarujala.com', 'Major National Newspapers', 0.75),
+    ('malayalamanorama.com', 'Major National Newspapers', 0.75),
+    ('eenadu.net', 'Major National Newspapers', 0.75),
+    ('anandabazar.com', 'Major National Newspapers', 0.75),
+
+    -- More contestable than the tiers above: placed by editorial
+    -- self-description (analysis/opinion-led, not wire-style reporting),
+    -- not a judgment of factual accuracy. Indian digital-native outlets
+    -- carry real political coding in a way "is this a government ministry"
+    -- doesn't - worth a second look if this tier's placements get questioned.
+    ('theprint.in', 'Blogs/Opinion', 0.30),
+    ('thewire.in', 'Blogs/Opinion', 0.30),
+    ('scroll.in', 'Blogs/Opinion', 0.30),
+
+    ('sharechat.com', 'Social Media', 0.10)
+on conflict (domain_pattern) do nothing;
