@@ -73,3 +73,43 @@ insert into source_credibility (domain_pattern, category, weight) values
     ('instagram.com', 'Social Media', 0.10),
     ('tiktok.com', 'Social Media', 0.10)
 on conflict (domain_pattern) do nothing;
+
+-- Sprint 18: Full Phase 2 Integration + Supabase Storage. Run this section
+-- against an existing database that already has the tables above (they
+-- aren't recreated here) - it's additive, not a fresh-install script.
+--
+-- storage_path/storage_expires_at: the downloaded/uploaded video file's
+-- location in Supabase Storage and when it should be deleted (24h retention -
+-- see app/db/client.cleanup_expired_media, checked on each Phase 2 request
+-- rather than a cron job, per the sprint's own "not required yet" allowance).
+-- extracted_text/extracted_text_expires_at: the combined transcript +
+-- visual_context + caption text actually fed into the Phase 1 pipeline (90-day
+-- retention) - kept separately from storage_path's much shorter window
+-- because the extracted text is cheap to keep and useful for audits/debugging
+-- long after the (large, storage-costly) video file itself is gone.
+alter table submissions add column if not exists storage_path text;
+alter table submissions add column if not exists storage_expires_at timestamptz;
+alter table submissions add column if not exists extracted_text text;
+alter table submissions add column if not exists extracted_text_expires_at timestamptz;
+
+-- Private bucket for temporarily-stored uploaded/downloaded video files.
+insert into storage.buckets (id, name, public)
+values ('media', 'media', false)
+on conflict (id) do nothing;
+
+-- Storage has RLS on by default, unlike the plain tables above (which have
+-- never had RLS enabled at all in this project - no auth system yet, so
+-- every table so far is wide open to the anon key). These three policies
+-- match that same all-open posture, just scoped to the one 'media' bucket
+-- Storage itself requires policies for.
+create policy "media bucket: anon can upload" on storage.objects
+    for insert to anon
+    with check (bucket_id = 'media');
+
+create policy "media bucket: anon can read" on storage.objects
+    for select to anon
+    using (bucket_id = 'media');
+
+create policy "media bucket: anon can delete" on storage.objects
+    for delete to anon
+    using (bucket_id = 'media');

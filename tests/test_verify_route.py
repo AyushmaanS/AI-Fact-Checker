@@ -1,4 +1,5 @@
 import io
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,13 +14,11 @@ from app.config import FASTROUTER_API_KEY, SUPABASE_KEY, SUPABASE_URL, TAVILY_AP
 from app.ingestion.media_downloader import DownloadResult
 from app.ingestion.url_resolver import ResolvedURL
 from app.main import app
-from app.models.schemas import Claim, ContentIntent, EvidenceLine, Verdict
+from app.models.schemas import Claim, ContentIntent, EvidenceLine, StructuredContentObject, Verdict
 from app.routes.verify import (
-    UPLOAD_PLACEHOLDER_MESSAGE,
-    URL_CAPTION_ONLY_MESSAGE,
+    NO_EXTRACTABLE_CONTENT_MESSAGE,
     URL_DOWNLOAD_FAILED_MESSAGE,
-    URL_DOWNLOADED_MESSAGE,
-    _build_upload_content,
+    _combine_content_for_pipeline,
     _save_upload_to_temp,
 )
 
@@ -116,7 +115,35 @@ def test_verdict_persisted_with_correct_db_claim_id_mapping(
     assert kwargs["claim_id"] == "db-uuid-xyz"  # not the pipeline id "c1"
 
 
-# --- Sprint 13: upload endpoint + caption path ---
+# --- Sprint 18: combining ingested content for the Phase 1 pipeline ---
+
+
+def test_combine_content_for_pipeline_includes_all_present_sections():
+    content = StructuredContentObject(
+        caption="A caption #test",
+        transcript="Spoken words here.",
+        visual_context="A scene description.",
+        media_type="video",
+    )
+    result = _combine_content_for_pipeline(content)
+    assert result == (
+        "Caption: A caption #test\n\n"
+        "Transcript: Spoken words here.\n\n"
+        "Visual context: A scene description."
+    )
+
+
+def test_combine_content_for_pipeline_omits_missing_sections():
+    content = StructuredContentObject(caption="Just a caption #test", media_type="text_post")
+    assert _combine_content_for_pipeline(content) == "Caption: Just a caption #test"
+
+
+def test_combine_content_for_pipeline_empty_when_nothing_present():
+    content = StructuredContentObject(caption="", media_type="text_post")
+    assert _combine_content_for_pipeline(content) == ""
+
+
+# --- Sprint 13/18: upload endpoint (now runs the real ingestion + Phase 1 pipeline) ---
 
 
 async def test_save_upload_to_temp_writes_a_real_file():
@@ -129,27 +156,31 @@ async def test_save_upload_to_temp_writes_a_real_file():
         assert Path(saved_path).read_bytes() == fake_bytes
         assert saved_path.endswith(".mp4")
     finally:
-        Path(saved_path).unlink(missing_ok=True)
+        shutil.rmtree(Path(saved_path).parent, ignore_errors=True)
 
 
-def test_build_upload_content_populates_caption_and_topics():
-    content = _build_upload_content("Big news! #factcheck #BreakingNews https://example.com/article")
-
-    assert content.caption == "Big news! #factcheck #BreakingNews https://example.com/article"
-    assert content.topics == ["factcheck", "BreakingNews", "https://example.com/article"]
-    assert content.media_type == "video"
-    assert content.transcript is None
-
-
-def test_build_upload_content_handles_no_caption():
-    content = _build_upload_content("")
-    assert content.caption == ""
-    assert content.topics == []
-
-
+@patch("app.routes.verify.cleanup_expired_media")
+@patch("app.routes.verify.update_submission_media")
+@patch("app.routes.verify.upload_media_file")
+@patch("app.routes.verify.classify_intent")
+@patch("app.routes.verify.route_and_assemble")
 @patch("app.routes.verify.insert_submission")
-def test_verify_upload_endpoint_end_to_end(mock_insert_submission):
+def test_verify_upload_endpoint_runs_pipeline_on_ingested_content(
+    mock_insert_submission,
+    mock_route_and_assemble,
+    mock_classify,
+    mock_upload_media_file,
+    mock_update_submission_media,
+    mock_cleanup,
+):
     mock_insert_submission.return_value = {"id": "sub-upload-1"}
+    mock_route_and_assemble.return_value = StructuredContentObject(
+        caption="Huge story! #factcheck",
+        transcript="Something was said in the video.",
+        visual_context=None,
+        media_type="video",
+    )
+    mock_classify.return_value = ContentIntent(label="OPINION", confidence=0.9)
 
     response = client.post(
         "/verify/upload",
@@ -160,30 +191,50 @@ def test_verify_upload_endpoint_end_to_end(mock_insert_submission):
     assert response.status_code == 200
     body = response.json()
     assert body["submission_id"] == "sub-upload-1"
-    assert body["claims"] == []
-    assert body["verdicts"] == []
-    assert body["message"] == UPLOAD_PLACEHOLDER_MESSAGE
+    assert "opinion" in body["message"].lower()
+
+    mock_cleanup.assert_called_once()
+    mock_upload_media_file.assert_called_once()
+    mock_update_submission_media.assert_called_once()
+
+    # The ingested transcript/caption actually reached the Phase 1 pipeline -
+    # the whole point of this sprint's wiring.
+    text_seen_by_pipeline = mock_classify.call_args.args[0]
+    assert "Something was said in the video." in text_seen_by_pipeline
+    assert "Huge story! #factcheck" in text_seen_by_pipeline
 
     _, kwargs = mock_insert_submission.call_args
-    assert kwargs["raw_input"] == "Huge story! #factcheck"
     # Must match the DB's real check constraint (see app/db/schema.sql):
-    # input_type in ('text', 'upload', 'url') - not a made-up value like
-    # "video_upload", which a mocked-DB test alone wouldn't have caught (and
-    # didn't, until this endpoint was checked against the real database).
+    # input_type in ('text', 'upload', 'url').
     assert kwargs["input_type"] == "upload"
 
 
+@patch("app.routes.verify.cleanup_expired_media")
+@patch("app.routes.verify.update_submission_media")
+@patch("app.routes.verify.upload_media_file")
+@patch("app.routes.verify.route_and_assemble")
 @patch("app.routes.verify.insert_submission")
-def test_verify_upload_endpoint_without_caption(mock_insert_submission):
+def test_verify_upload_endpoint_no_extractable_content(
+    mock_insert_submission,
+    mock_route_and_assemble,
+    mock_upload_media_file,
+    mock_update_submission_media,
+    mock_cleanup,
+):
     mock_insert_submission.return_value = {"id": "sub-upload-2"}
+    mock_route_and_assemble.return_value = StructuredContentObject(
+        caption="", transcript=None, visual_context=None, media_type="video"
+    )
 
     response = client.post("/verify/upload", files={"file": ("clip.mp4", b"bytes", "video/mp4")})
 
     assert response.status_code == 200
-    assert response.json()["claims"] == []
+    body = response.json()
+    assert body["claims"] == []
+    assert body["message"] == NO_EXTRACTABLE_CONTENT_MESSAGE
 
 
-# --- Sprint 14: media downloader + /verify/url ---
+# --- Sprint 14/18: media downloader + /verify/url (now runs the real pipeline) ---
 
 
 def test_verify_url_empty_url_returns_400():
@@ -191,10 +242,24 @@ def test_verify_url_empty_url_returns_400():
     assert response.status_code == 400
 
 
+@patch("app.routes.verify.cleanup_expired_media")
+@patch("app.routes.verify.update_submission_media")
+@patch("app.routes.verify.upload_media_file")
+@patch("app.routes.verify.classify_intent")
+@patch("app.routes.verify.route_and_assemble")
 @patch("app.routes.verify.insert_submission")
 @patch("app.routes.verify.download_media")
 @patch("app.routes.verify.resolve_url")
-def test_verify_url_successful_download(mock_resolve, mock_download, mock_insert_submission):
+def test_verify_url_successful_download_runs_pipeline(
+    mock_resolve,
+    mock_download,
+    mock_insert_submission,
+    mock_route_and_assemble,
+    mock_classify,
+    mock_upload_media_file,
+    mock_update_submission_media,
+    mock_cleanup,
+):
     mock_resolve.return_value = ResolvedURL(
         canonical_url="https://www.instagram.com/reel/abc123/", platform="instagram"
     )
@@ -202,6 +267,10 @@ def test_verify_url_successful_download(mock_resolve, mock_download, mock_insert
         success=True, file_path="/tmp/ingest_x/abc123.mp4", caption="A real caption"
     )
     mock_insert_submission.return_value = {"id": "sub-url-1"}
+    mock_route_and_assemble.return_value = StructuredContentObject(
+        caption="A real caption", transcript="Spoken content from the reel.", visual_context=None, media_type="video"
+    )
+    mock_classify.return_value = ContentIntent(label="UNRELATED", confidence=0.9)
 
     response = client.post(
         "/verify/url", json={"url": "https://www.instagram.com/reel/abc123/?igsh=xyz"}
@@ -210,40 +279,72 @@ def test_verify_url_successful_download(mock_resolve, mock_download, mock_insert
     assert response.status_code == 200
     body = response.json()
     assert body["claims"] == []
-    assert body["message"] == URL_DOWNLOADED_MESSAGE
+    assert "factual claim" in body["message"].lower()
 
     _, kwargs = mock_insert_submission.call_args
     # The resolved canonical URL is persisted, not the raw messy input.
     assert kwargs["raw_input"] == "https://www.instagram.com/reel/abc123/"
-    # Must match the DB's real check constraint - see the same note on
-    # test_verify_upload_endpoint_end_to_end.
     assert kwargs["input_type"] == "url"
 
+    mock_upload_media_file.assert_called_once()
+    mock_route_and_assemble.assert_called_once_with(
+        "/tmp/ingest_x/abc123.mp4", caption="A real caption", source_url="https://www.instagram.com/reel/abc123/"
+    )
+    text_seen_by_pipeline = mock_classify.call_args.args[0]
+    assert "Spoken content from the reel." in text_seen_by_pipeline
 
+
+@patch("app.routes.verify.cleanup_expired_media")
+@patch("app.routes.verify.update_submission_media")
+@patch("app.routes.verify.upload_media_file")
+@patch("app.routes.verify.classify_intent")
+@patch("app.routes.verify.route_and_assemble")
 @patch("app.routes.verify.insert_submission")
 @patch("app.routes.verify.download_media")
 @patch("app.routes.verify.resolve_url")
-def test_verify_url_caption_only_fallback(mock_resolve, mock_download, mock_insert_submission):
+def test_verify_url_caption_only_fallback_skips_storage_upload(
+    mock_resolve,
+    mock_download,
+    mock_insert_submission,
+    mock_route_and_assemble,
+    mock_classify,
+    mock_upload_media_file,
+    mock_update_submission_media,
+    mock_cleanup,
+):
     mock_resolve.return_value = ResolvedURL(
         canonical_url="https://www.instagram.com/reel/rate-limited/", platform="instagram"
     )
     mock_download.return_value = DownloadResult(success=False, caption="Still got this caption")
     mock_insert_submission.return_value = {"id": "sub-url-2"}
+    mock_route_and_assemble.return_value = StructuredContentObject(
+        caption="Still got this caption", transcript=None, visual_context=None, media_type="text_post"
+    )
+    mock_classify.return_value = ContentIntent(label="UNRELATED", confidence=0.9)
 
     response = client.post("/verify/url", json={"url": "https://www.instagram.com/reel/rate-limited/"})
 
     assert response.status_code == 200
-    assert response.json()["message"] == URL_CAPTION_ONLY_MESSAGE
+    # No file was downloaded, so nothing should be uploaded to Storage.
+    mock_upload_media_file.assert_not_called()
+    mock_route_and_assemble.assert_called_once_with(
+        None, caption="Still got this caption", source_url="https://www.instagram.com/reel/rate-limited/"
+    )
 
 
+@patch("app.routes.verify.cleanup_expired_media")
 @patch("app.routes.verify.insert_submission")
 @patch("app.routes.verify.download_media")
 @patch("app.routes.verify.resolve_url")
-def test_verify_url_clean_failure_when_nothing_is_reachable(mock_resolve, mock_download, mock_insert_submission):
+def test_verify_url_clean_failure_when_nothing_is_reachable(
+    mock_resolve, mock_download, mock_insert_submission, mock_cleanup
+):
     mock_resolve.return_value = ResolvedURL(
         canonical_url="https://www.instagram.com/reel/private-post/", platform="instagram"
     )
-    mock_download.return_value = DownloadResult(success=False, caption=None, error="Could not download this content.")
+    mock_download.return_value = DownloadResult(
+        success=False, caption=None, error="Could not download this content."
+    )
     mock_insert_submission.return_value = {"id": "sub-url-3"}
 
     response = client.post("/verify/url", json={"url": "https://www.instagram.com/reel/private-post/"})

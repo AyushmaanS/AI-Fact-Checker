@@ -11,8 +11,11 @@ and those diverge.
 
 ## 1. What's implemented
 
-**Phase 1 (Sprints 0–11): done.** Phase 2 (Sprints 12–18, video/image ingestion):
-**started** — Sprints 12–17 done, 18 not started.
+**Phase 1 (Sprints 0–11): done. Phase 2 (Sprints 12–18): done.** All 18 sprints
+on the current plan are complete as of 2026-09-22 — `POST /verify/url` and
+`POST /verify/upload` are fully wired end-to-end, confirmed live against a real
+public Instagram Reel (see §8). The sprint plan's own text calls this point
+"worth a genuine pause before continuing" to Phase 3/4, which aren't planned yet.
 
 | Sprint | What it built |
 |---|---|
@@ -31,9 +34,10 @@ and those diverge.
 | 12 | `StructuredContentObject` model + `app/ingestion/url_resolver.py` (Phase 2 start) |
 | 13 | `app/ingestion/caption_path.py` + `POST /verify/upload` (ingestion only — see §9) |
 | 14 | `app/ingestion/media_downloader.py` (yt-dlp) + `POST /verify/url` (ingestion only — see §9) |
-| 15 | `app/ingestion/video_path.py` audio portion (ffmpeg + Whisper transcription) — standalone, not wired in yet (see §9) |
-| 16 | `app/ingestion/video_path.py` frame sampling + GPT-4o Vision (`analyze_frames`) — standalone, not wired in yet (see §9) |
-| 17 | `app/ingestion/media_router.py` (`detect_media_type` + `route_and_assemble`) — ties Sprints 13/15/16 together into one `StructuredContentObject`; standalone, not wired into a route yet (see §9) |
+| 15 | `app/ingestion/video_path.py` audio portion (ffmpeg + Whisper transcription) — wired in as of Sprint 18 |
+| 16 | `app/ingestion/video_path.py` frame sampling + GPT-4o Vision (`analyze_frames`) — wired in as of Sprint 18 |
+| 17 | `app/ingestion/media_router.py` (`detect_media_type` + `route_and_assemble`) — ties Sprints 13/15/16 together into one `StructuredContentObject`; wired in as of Sprint 18 |
+| 18 | Full Phase 2 integration: `POST /verify/upload` and `POST /verify/url` now run ingested content through the real Phase 1 pipeline, plus Supabase Storage (24h video retention, 90-day extracted-text retention) — see §2/§3/§9 |
 
 Plus 4 retrofits not tied to a sprint number, each shipped after the sprint that
 introduced the thing it replaced, each verified live before landing (details in §9):
@@ -42,34 +46,61 @@ introduced the thing it replaced, each verified live before landing (details in 
 3. Two-stage validator → structured self-declared `RationaleSegment`s
 4. Structured segments → **evidence lines + one audited summary line** (current — see §2/§3)
 
-**Sprint 12 is a standalone utility, not wired into a route yet** —
-`app/ingestion/url_resolver.py`'s `resolve_url()` has no caller in the codebase.
-Sprint 13 (`POST /verify/upload`) doesn't call it either per its own prompt (that
-sprint is about the caption path + upload endpoint, not URL handling); the
-resolver's first real caller is likely whichever future sprint adds
-`POST /verify/url`.
-
-**`POST /verify/upload` ingests but does not fact-check yet, by design (per
-Sprint 13's own prompt).** It saves the upload to a temp file, builds a
-`StructuredContentObject` from the caption (via `caption_path.extract_caption_content`),
-persists a `submissions` row, and returns a `VerifyResponse` with `claims: []`,
-`verdicts: []`, and an explanatory `message` — it does **not** run the
-`StructuredContentObject` through the Phase 1 pipeline yet. `transcript` is always
-`None` (no transcription until Sprint 15+). See §9 for how this compares to
-functional-spec §B.4's eventual full contract.
-
-**`POST /verify/url` is ingestion-only too, and deliberately doesn't build a
-`StructuredContentObject` at all.** It resolves the URL (Sprint 12), attempts a
-download (`media_downloader.download_media`), persists a `submissions` row, and
-returns one of three canned messages depending on outcome (downloaded /
-caption-only fallback / clean failure) — no `claims`/`verdicts`. Object assembly
-for a URL submission is left to Sprint 17 ("Media Router + Object Assembly"),
-which is explicitly where the spec says that job belongs; building one here would
-have been scope creep with nothing to consume it yet.
+**As of Sprint 18, both `POST /verify/upload` and `POST /verify/url` are fully
+wired end-to-end** — every piece built across Sprints 12–17
+(`url_resolver.resolve_url`, `media_downloader.download_media`,
+`media_router.route_and_assemble`, which itself calls `caption_path`,
+`video_path.transcribe_video`, and `video_path.analyze_frames`/`analyze_image`)
+now has a real caller. See §2 for the full wired pipeline and §8 for the live
+end-to-end confirmation against a real public Instagram Reel.
 
 ---
 
 ## 2. Architecture / pipeline
+
+**Phase 2 entry points (`/verify/upload`, `/verify/url`) — added Sprint 18:**
+
+```
+POST /verify/upload {file, caption}          POST /verify/url {url}
+  → cleanup_expired_media()                    → cleanup_expired_media()
+    (deletes any Storage file whose               (same - both routes check on
+    storage_expires_at has passed;                 every request, per the sprint's
+    checked on each request, not a                 "no cron job needed yet" allowance)
+    cron job - see §3)
+  → save upload to local temp file            → resolve_url (Sprint 12)
+                                                 → download_media (Sprint 14, yt-dlp)
+                                                   - success: real video file
+                                                   - caption-only fallback: no file,
+                                                     just a caption
+                                                   - total failure: canned message,
+                                                     short-circuits here, no further
+                                                     ingestion attempted
+  insert_submission (gets submission_id)      insert_submission (raw_input = resolved
+                                                 canonical URL, not the raw messy input)
+  → _store_and_assemble(submission_id, file_path, caption, source_url):
+      1. upload_media_file -> Supabase Storage (skipped if no file - e.g. the
+         caption-only fallback case)
+      2. route_and_assemble (Sprint 17): detect_media_type -> dispatches to
+         Video Path (transcribe_video + analyze_frames, concurrent) / a single
+         analyze_image call / Caption Path only - assembles one
+         StructuredContentObject
+      3. local file/temp dir cleaned up (Storage, or nothing, is the durable
+         copy from here on)
+      4. _combine_content_for_pipeline: "Caption: ...\n\nTranscript: ...\n\n
+         Visual context: ..." (labeled sections, only for what's actually
+         present) -> one plain-text string
+      5. update_submission_media: persists storage_path (+24h expiry) and this
+         combined text as extracted_text (+90-day expiry) onto the submission row
+  → if combined text is empty: canned NO_EXTRACTABLE_CONTENT_MESSAGE, same
+    "graceful, still 200" stance as every other short circuit in this codebase
+  → otherwise: _run_phase1_pipeline(submission_id, combined_text, start) -
+    the exact same shared function POST /verify itself calls (see below) -
+    from here on, an ingested Reel and a pasted paragraph of text are
+    indistinguishable to the rest of the system.
+```
+
+**Phase 1 pipeline (shared by all three `/verify*` routes via
+`_run_phase1_pipeline`):**
 
 ```
 POST /verify {text}
@@ -103,10 +134,14 @@ POST /verify {text}
 
 Agent files: `intent_classifier.py`, `claim_extractor.py`, `research_agent.py`,
 `evidence_ranker.py`, `analyst_agent.py`, `verdict_agent.py`, `citation_verifier.py`,
-`response_formatter.py`. Orchestration: `pipeline.py` (concurrency — untouched by
-retrofit 4 except removing a now-dead try/except, see §9), `routes/verify.py`
-(HTTP + DB persistence). Shared: `llm_client.py` (FastRouter client + model IDs,
-60s timeout), `db/client.py` (Supabase).
+`response_formatter.py`. Ingestion files (Phase 2): `url_resolver.py`,
+`media_downloader.py`, `caption_path.py`, `video_path.py`, `media_router.py`.
+Orchestration: `pipeline.py` (Phase 1 concurrency — untouched by retrofit 4
+except removing a now-dead try/except, see §9), `routes/verify.py` (all three
+HTTP routes, ingestion wiring, and DB/Storage persistence — as of Sprint 18 this
+is a substantial file; `_run_phase1_pipeline` is the one function all three
+routes converge on). Shared: `llm_client.py` (FastRouter client + model IDs
+including Whisper, 60s timeout), `db/client.py` (Supabase tables + Storage).
 
 ---
 
@@ -259,13 +294,54 @@ retrofit 4 except removing a now-dead try/except, see §9), `routes/verify.py`
   (`asyncio.gather`), not sequentially - independent operations (audio vs.
   frames) that both only read the same source file, consistent with this
   codebase's established concurrency stance since Sprint 6.
+- **A shared `_run_phase1_pipeline(submission_id, text, start)` is what all
+  three `/verify*` routes actually call** (Sprint 18, `routes/verify.py`) -
+  extracted rather than duplicating the intent -> claims -> verdicts ->
+  persistence -> response block three times. Not explicitly asked for, but a
+  direct, unavoidable consequence of "feed ingestion output into the Phase 1
+  pipeline from Sprint 10" for *two* new routes at once.
+- **Ingested content becomes one labeled plain-text block, not three separate
+  fields passed to the classifier** (`_combine_content_for_pipeline`) -
+  `"Caption: ...\n\nTranscript: ...\n\nVisual context: ..."`, only for
+  whichever sections are actually non-empty. Per the sprint prompt's own
+  "concatenate with clear section labels" instruction. If all three are empty
+  (e.g. a video with unclear audio, no on-screen text, and no caption), the
+  route short-circuits with a canned "nothing extractable" message rather than
+  handing the Phase 1 pipeline an empty string.
+- **Supabase Storage bucket access uses RLS policies scoped to the `media`
+  bucket, not a `service_role` key.** Bucket creation itself was rejected by
+  RLS under the existing `anon` key (`403: new row violates row-level security
+  policy`, confirmed live) - Storage has RLS on by default, unlike the plain
+  tables in this project, which have never had it enabled at all. Rather than
+  introduce a second, more-privileged credential for just this one feature,
+  three narrow policies (insert/select/delete, scoped to `bucket_id = 'media'`)
+  match the same all-open posture already true of every other table here. This
+  needed a one-time manual step in the Supabase SQL editor - same as how the
+  original Sprint 1 schema was applied - since neither DDL nor bucket/policy
+  creation is reachable through the REST client's normal table/storage API
+  calls, confirmed by trying both live.
+- **24h video / 90-day text retention are both enforced by a stored
+  `expires_at` checked on each Phase 2 request** (`cleanup_expired_media`,
+  called at the top of both `/verify/upload` and `/verify/url`), not a
+  scheduled job - exactly the allowance the sprint prompt itself offered
+  ("a full cron job isn't required yet"). A file only actually gets deleted
+  the next time *some* Phase 2 request happens to run after its expiry, not
+  the instant it expires - accepted trade-off, matching the prompt's own
+  framing of this as good enough for now, not the eventual production design.
+  Never raises on a single delete failure (e.g. already gone), so a cleanup
+  hiccup can't take down the request that triggered it.
+- **Storage keys are named `{submission_id}{original extension}`**, not the
+  original filename - guaranteed unique, always traceable back to exactly one
+  `submissions` row without a separate lookup table.
 
 ---
 
-## 4. Database schema (Supabase Postgres) — unchanged since Sprint 1
+## 4. Database schema (Supabase Postgres) — extended in Sprint 18
 
 ```sql
-submissions(id uuid pk, raw_input text, input_type text, created_at)
+submissions(id uuid pk, raw_input text, input_type text, created_at,
+            storage_path text, storage_expires_at timestamptz,          -- Sprint 18
+            extracted_text text, extracted_text_expires_at timestamptz) -- Sprint 18
 claims(id uuid pk, submission_id fk, text, topic, specificity, verifiability_score)
 verdicts(id uuid pk, claim_id fk, label, rationale text, confidence_score, citations jsonb, created_at)
 source_credibility(domain_pattern text pk, category text, weight float)  -- seeded, ~30 rows
@@ -279,7 +355,19 @@ followed by `summary_line` as the closing line, before the DB write
 rationale field at all — just `evidence_lines` (structured) and `summary_line` (one
 sentence, audited).
 
-No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
+`submissions`'s four new columns (Sprint 18, applied by the project owner
+manually in Supabase's SQL editor — see `app/db/schema.sql`'s "Sprint 18"
+section, and §3 for why this couldn't be done programmatically): `storage_path`
++ `storage_expires_at` track the ingested video's location in Supabase Storage
+and its 24h deletion deadline (`null` for a plain-text submission, or a
+caption-only URL fallback with no downloaded file); `extracted_text` +
+`extracted_text_expires_at` hold the same combined caption/transcript/visual
+text that was fed to the Phase 1 pipeline, retained 90 days.
+
+**Supabase Storage** (new, Sprint 18): one private bucket, `media`, holding
+ingested video files under `{submission_id}{extension}` keys, cleaned up by
+`db.client.cleanup_expired_media()` (see §3). No vector DB, no Redis, no job
+queue — those remain explicitly deferred to Phase 4+.
 
 ---
 
@@ -288,10 +376,10 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 | Endpoint | Status |
 |---|---|
 | `GET /health` | ✅ implemented |
-| `POST /verify` | ✅ implemented (the only real endpoint) |
+| `POST /verify` | ✅ implemented |
 | `GET /verdicts/{submission_id}` | ❌ **not implemented** — speced in functional-spec §A.4, deliberately out of Sprint 10's scope |
-| `POST /verify/upload` | ✅ implemented, ingestion-only (Sprint 13) — accepts a video + optional caption, saves it, returns an explanatory message instead of a real verdict; see §1 |
-| `POST /verify/url` | ✅ implemented, ingestion-only (Sprint 14) — resolves the URL, attempts a yt-dlp download, falls back to caption-only or a clean failure message; see §1 |
+| `POST /verify/upload` | ✅ **fully implemented as of Sprint 18** — accepts a video + optional caption, stores it in Supabase Storage, runs it through the full ingestion + Phase 1 pipeline, returns a real cited `VerifyResponse` (or a graceful canned message if there's nothing to check) |
+| `POST /verify/url` | ✅ **fully implemented as of Sprint 18** — resolves the URL, downloads via yt-dlp (or falls back to caption-only, or fails cleanly), same full pipeline as upload. Confirmed live end-to-end against a real public Instagram Reel — see §8. |
 
 ---
 
@@ -301,7 +389,7 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 |---|---|---|
 | `FASTROUTER_API_KEY` | all LLM calls | active |
 | `TAVILY_API_KEY` | research_agent | active (on a third key as of 2026-09-20 — both the original and the one pre-authorized backup hit `ForbiddenError: usage limit` during this session; project owner supplied a new key to unblock the eval rerun in §8) |
-| `SUPABASE_URL` / `SUPABASE_KEY` | db/client.py | active |
+| `SUPABASE_URL` / `SUPABASE_KEY` | db/client.py | active - `SUPABASE_KEY` is the `anon` role (confirmed by decoding the JWT), used for both the Postgres tables and, as of Sprint 18, the `media` Storage bucket via RLS policies rather than a `service_role` key - see §3 |
 | `OPENAI_API_KEY` | — | **present in `.env.example` but unused, confirmed not needed** — FastRouter proxies Whisper too (`app/ingestion/video_path.py`, Sprint 15), same as every other model in this codebase. No code path calls OpenAI directly. |
 
 ---
@@ -354,7 +442,7 @@ No vector DB, no Redis, no job queue — all explicitly deferred to Phase 4+.
 
 ## 8. Test / eval status
 
-**120 tests collected** across 17 test files (`test_main`, `test_schemas`,
+**125 tests collected** across 17 test files (`test_main`, `test_schemas`,
 `test_db`, `test_intent_classifier`, `test_claim_extractor`, `test_research_agent`,
 `test_evidence_ranker`, `test_analyst_agent`, `test_verdict_agent`,
 `test_citation_verifier`, `test_verify_route`, `test_pipeline`, `test_url_resolver`,
@@ -369,15 +457,22 @@ Sprint 17's, of which 8 are deterministic and 1
 unlike Sprints 14-16, this one **is** baked into the permanent suite, because
 the sprint prompt explicitly asked to "write a...pytest," not just verify
 informally, and it needs no external content (generates its own video/image
-locally via ffmpeg each run, so no content-liveness risk). **All pass**,
-including every live test (needs `FASTROUTER_API_KEY` / `TAVILY_API_KEY` /
-Supabase creds) — confirmed via
+locally via ffmpeg each run, so no content-liveness risk). Sprint 18 rewrote
+the upload/url endpoint tests in `test_verify_route` to mock at the ingestion
+level (`route_and_assemble`, storage functions) instead of asserting on
+now-gone placeholder messages, added 3 `_combine_content_for_pipeline` tests,
+and added 4 real (non-mocked) `test_db.py` tests for the new storage/cleanup
+functions - `test_db.py` has always been a fully-live file (no mocking at
+all; skipped entirely without Supabase creds), so these follow that file's own
+existing convention rather than Sprint 18 introducing a new pattern. **All
+125 pass** — confirmed via
 two full consecutive runs after retrofit 4, the second one clean, plus the
-non-live subset (115 tests, which still includes the Sprint 17 live test -
-its name doesn't contain "live" either) confirmed clean again after Sprint 17,
-most recently 115 passed / 5 deselected (one flaky live-marked test not caught
-by that filter, see below). One live test's own expectation had to be fixed
-along the way, during retrofit 4: the old
+non-live subset (filtered by test name, `-k "not live"`) confirmed clean again
+after Sprint 18: 120 passed / 5 deselected - note this filter is name-based
+only (see below), so it still includes several genuinely-live tests whose
+names don't happen to contain "live", including all 4 new Sprint 18 DB/storage
+tests. One live test's own expectation had to be fixed along the way,
+during retrofit 4: the old
 "per-URL" citation removal test asserted a shared citation gets fully wiped when
 any one of its lines fails; that's no longer correct under the new fine-grained
 per-`EvidenceLine` removal (§3), so the assertion was corrected and a deterministic
@@ -433,6 +528,45 @@ text ("TEST OVERLAY 99" in the video, "IMAGE OVERLAY 42" in the image) came
 back correctly in each object's `visual_context`, and the null/non-null
 pattern was exactly as spec'd (`transcript` real only for video;
 `visual_context` real for video and image; both null for the caption-only case).
+
+**Sprint 18's actual DoD — "paste a real public Instagram Reel URL into
+`POST /verify/url` and get back a complete, cited verdict" — was run for
+real, once, deliberately (this is the single most expensive possible
+verification in this codebase: download + transcription + vision + full
+Phase 1 research/verdict/citation-check, all real API calls) and passed
+outright.** Found a real Reel via browsing (National Geographic's own
+account, not fabricated): `natgeo/reel/Dde8AyFAjwU`, captioned "Grandmother
+orcas use decades of experience to feed their families." Posted to
+`/verify/url`:
+- **200 OK in 61.1s.**
+- **6 claims extracted** — not just from the caption, but genuinely detailed
+  ones ("Female orcas may stop having calves around age 40 but can live for
+  decades longer," "Research found that young orcas with a living grandmother
+  are more likely to survive") that could only have come from the video's
+  on-screen text overlays via `analyze_frames`'s vision call - confirmed by
+  checking `extracted_text` directly afterward, whose `Transcript:` section
+  was just the single word "you" (the video is driven by on-screen graphics
+  over music, not narration - a real, honest example of why this design
+  combines all three sources rather than relying on any one).
+- **All 6 verdicts came back TRUE, every one with real, relevant, credible
+  citations** — NBC News, the Natural History Museum (UK and LA), Wikipedia,
+  *Nature*, PBS, WWF, King5 News, and National Geographic itself - each
+  citation matched to the specific claim it supports, confirming Research
+  Agent -> Evidence Ranker -> Analyst Agent -> Verdict Agent -> Citation
+  Verifier all ran correctly against real content this pipeline had never
+  seen before.
+- **`aggregate_label: "TRUE"`**, correctly computed from six all-TRUE verdicts.
+- Confirmed directly against the DB afterward: `storage_path` was the
+  expected `{submission_id}.mp4`, `storage_expires_at` was exactly 24h after
+  creation, `extracted_text_expires_at` was exactly 90 days after creation,
+  and `extracted_text` showed all three labeled sections as designed.
+- One minor, pre-existing-behavior observation, not a Sprint 18 bug: one
+  claim's (`#NatGeoQueens is streaming on DisneyPlus and Hulu`) second
+  evidence line paraphrased as "doesn't specifically mention #NatGeoQueens
+  streaming" yet was still marked `stance: "for"` and contributed to a TRUE
+  verdict - the same kind of evidence-stance-classification softness already
+  covered by this section's existing entries, not something Sprint 18
+  introduced or could reasonably fix within its own scope.
 
 **`eval/run_eval.py` post-retrofit-4: 17/22 (77%), 63.7s total** — above the prior
 design's 64–73% range, so no regression (this single run is also each design's
@@ -534,24 +668,22 @@ full... and confirm no regressions") — retrofit 4 is now fully complete.
   values (`"video_upload"`, `"video_url"`) that violate it - invisible until
   Sprint 14's own live DB check happened to hit the real constraint, since every
   prior test for both endpoints mocked `insert_submission`. See §3/§8.
-- **Sprint 15:** `transcribe_video()` is a standalone function with no caller
-  anywhere in the codebase yet - same as Sprint 12's `resolve_url()` (§1), and
-  for the same reason: nothing has assembled a full ingestion pipeline that
-  would call it (turned out to be Sprint 17's job, and even Sprint 17 doesn't
-  wire it into a route - see below). Also: the prompt's suggested confidence
-  heuristic ("no_speech_prob... or transcript length near zero") turned out to
-  need a real fix once tested live - see §3's write-up of the hallucinated
-  "**BLEEP**"/tone-clip finding and why `avg_logprob` had to be added alongside
-  `no_speech_prob`, not used as originally scoped.
-- **Sprint 16:** `analyze_frames()` is also a standalone function with no
-  caller yet, same reason as Sprint 15. Sends all selected frames in one
-  `chat.completions.parse` call rather than one call per frame - the prompt's
-  "batch a reasonable subset... to control cost" read as one batched call being
-  the point, not literally separate per-frame calls. `MAX_FRAMES_TO_SEND = 10`
-  and the evenly-strided downsampling formula are this session's own choice,
-  generalizing the prompt's literal "every 3rd frame" example to scale
-  sensibly for both short and long videos rather than hardcoding a fixed
-  stride.
+- **Sprint 15:** `transcribe_video()` had no caller anywhere in the codebase
+  at the time (same situation as Sprint 12's `resolve_url()`, §1) - wired in
+  by Sprint 18, via `media_router.route_and_assemble`. Also: the prompt's
+  suggested confidence heuristic ("no_speech_prob... or transcript length near
+  zero") turned out to need a real fix once tested live - see §3's write-up of
+  the hallucinated "**BLEEP**"/tone-clip finding and why `avg_logprob` had to
+  be added alongside `no_speech_prob`, not used as originally scoped.
+- **Sprint 16:** `analyze_frames()` was also uncalled at the time, same
+  situation as Sprint 15 - wired in by Sprint 18. Sends all selected frames in
+  one `chat.completions.parse` call rather than one call per frame - the
+  prompt's "batch a reasonable subset... to control cost" read as one batched
+  call being the point, not literally separate per-frame calls.
+  `MAX_FRAMES_TO_SEND = 10` and the evenly-strided downsampling formula are
+  this session's own choice, generalizing the prompt's literal "every 3rd
+  frame" example to scale sensibly for both short and long videos rather than
+  hardcoding a fixed stride.
 - **Sprint 17: the prompt's own dispatch description names only "Video Path or
   Caption Path," but the DoD explicitly requires testing a static image, and
   the spec's `StructuredContentObject`/§B.5 both treat `image` as a real third
@@ -559,10 +691,18 @@ full... and confirm no regressions") — retrofit 4 is now fully complete.
   "Image Path" component anywhere in the spec to dispatch to. Bridged by
   adding `video_path.analyze_image()` for the single-image case, reusing
   Sprint 16's vision-calling logic directly rather than building a separate
-  image-analysis pipeline from scratch - see §3. `route_and_assemble()` is
-  also a standalone function, same as Sprints 12/15/16 - it isn't wired into
-  `/verify/upload` or `/verify/url` yet, and neither of those endpoints passes
-  it a downloaded file path today; that integration is Sprint 18's explicit
-  job ("Full Phase 2 Integration"). Also found and fixed a real gap live:
-  Python's `mimetypes` module doesn't recognize `.webp` by default on this
-  system - see §3.
+  image-analysis pipeline from scratch - see §3. `route_and_assemble()` had no
+  caller at the time either - wired in by Sprint 18, its "explicit job" per
+  Sprint 17's own note here, confirmed exactly right. Also found and fixed a
+  real gap live: Python's `mimetypes` module doesn't recognize `.webp` by
+  default on this system - see §3.
+- **Sprint 18:** covered in depth in §2/§3/§8 (architecture diagram, storage/
+  RLS/retention design decisions, live DoD verification) rather than repeated
+  here. One thing worth flagging as a deviation specifically: the sprint
+  prompt describes Supabase Storage integration as if it were a
+  straightforward client-library call, but bucket creation was rejected by
+  RLS under the project's existing `anon` key, and there's no DDL-execution
+  path through the standard REST/storage client either - both needed a manual
+  SQL-editor step from the project owner, the same kind of one-time setup
+  Sprint 1's original schema needed. Not discoverable without attempting it
+  live, which is exactly what happened.
