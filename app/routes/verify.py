@@ -20,7 +20,7 @@ from app.db.client import (
     update_submission_media,
     upload_media_file,
 )
-from app.ingestion.media_downloader import download_media
+from app.ingestion.media_downloader import NO_VIDEO_ERROR, download_media
 from app.ingestion.media_router import route_and_assemble
 from app.ingestion.url_resolver import resolve_url
 from app.models.schemas import StructuredContentObject, VerifyResponse
@@ -43,6 +43,11 @@ NO_EXTRACTABLE_CONTENT_MESSAGE = (
 URL_DOWNLOAD_FAILED_MESSAGE = (
     "Could not download this content, and no caption text was available either - "
     "the post may be private, deleted, or the platform is rate-limiting downloads."
+)
+URL_NO_VIDEO_MESSAGE = (
+    "This looks like a photo post, not a video - this app can currently only check "
+    "Reels and other videos from a URL. Try pasting the caption text into the "
+    "'Paste a claim' tab instead."
 )
 
 
@@ -235,12 +240,13 @@ async def verify_url(request: VerifyUrlRequest) -> VerifyResponse:
         # spec B.5: private/deleted/broken URL -> a clean user-facing message,
         # never a raw stack trace. Still a 200 - the request itself was handled
         # correctly, same as the non-factual-intent/zero-claim short circuits.
+        message = URL_NO_VIDEO_MESSAGE if result.error == NO_VIDEO_ERROR else URL_DOWNLOAD_FAILED_MESSAGE
         return format_response(
             submission_id=submission_id,
             claims=[],
             verdicts=[],
             processing_time_ms=_elapsed_ms(start),
-            message=URL_DOWNLOAD_FAILED_MESSAGE,
+            message=message,
         )
 
     combined_text = await _store_and_assemble(

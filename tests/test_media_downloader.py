@@ -1,6 +1,6 @@
 from unittest.mock import patch
 
-from app.ingestion.media_downloader import DOWNLOAD_FAILED_TEXT, download_media
+from app.ingestion.media_downloader import DOWNLOAD_FAILED_TEXT, NO_VIDEO_ERROR, download_media
 
 
 @patch("app.ingestion.media_downloader._find_downloaded_file")
@@ -52,6 +52,23 @@ async def test_download_media_reports_clean_failure_when_both_attempts_fail(mock
     assert result.file_path is None
     assert result.caption is None
     assert result.error == DOWNLOAD_FAILED_TEXT
+    assert mock_extract.call_count == 2
+
+
+@patch("app.ingestion.media_downloader._extract_sync")
+async def test_download_media_detects_photo_post_with_no_video(mock_extract):
+    # A photo post/carousel, not a Reel - yt-dlp's Instagram extractor raises
+    # this exact, stable error on both the download and metadata-only attempts
+    # (it parses the caption internally but discards it before returning, once
+    # it sees there are no video formats - see instagram.py's raise_no_formats
+    # call). Confirmed live: two real photo-post URLs hit this verbatim.
+    mock_extract.side_effect = RuntimeError("[Instagram] abc123: There is no video in this post")
+
+    result = await download_media("https://www.instagram.com/p/abc123/")
+
+    assert result.success is False
+    assert result.caption is None
+    assert result.error == NO_VIDEO_ERROR
     assert mock_extract.call_count == 2
 
 
