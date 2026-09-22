@@ -19,10 +19,16 @@ DOWNLOAD_FAILED_TEXT = "Could not download this content."
 PHOTO_POST_FALLBACK_FAILED_ERROR = "photo_post_fallback_failed"
 # yt-dlp's own error text when a post has no video at all (a photo post) -
 # it parses the caption internally but discards it before returning, once it
-# sees there are no video formats (see instagram.py's raise_no_formats call) -
-# so unlike a real rate-limit/private-post failure, retrying the metadata-only
-# attempt is pointless here; the instaloader fallback is tried instead.
-_NO_VIDEO_MARKER = "no video in this post"
+# sees there are no video formats. Two different messages depending on the
+# code path: "There is no video in this post" (instagram.py's own
+# raise_no_formats, for a single non-carousel post) or the generic "No video
+# formats found!" (YoutubeDL's own core-level check, which fires instead for
+# a carousel - the Instagram-specific check only runs when the post isn't a
+# playlist/carousel; confirmed live against a real 5-item mixed photo/video
+# carousel). Unlike a real rate-limit/private-post failure, retrying the
+# metadata-only attempt is pointless for either - the instaloader fallback is
+# tried instead.
+_NO_VIDEO_MARKERS = ("no video in this post", "no video formats found")
 
 _YDL_OPTS_BASE = {
     "quiet": True,
@@ -53,7 +59,8 @@ def _find_downloaded_file(temp_dir: str) -> Optional[str]:
 
 
 def _is_no_video_error(exc: Exception) -> bool:
-    return _NO_VIDEO_MARKER in str(exc).lower()
+    text = str(exc).lower()
+    return any(marker in text for marker in _NO_VIDEO_MARKERS)
 
 
 async def _try_photo_post_fallback(url: str) -> DownloadResult:

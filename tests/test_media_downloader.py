@@ -82,6 +82,31 @@ async def test_download_media_falls_back_to_instaloader_on_no_video_error(mock_e
 
 @patch("app.ingestion.media_downloader.download_photo_post")
 @patch("app.ingestion.media_downloader._extract_sync")
+async def test_download_media_falls_back_to_instaloader_on_generic_no_formats_error(
+    mock_extract, mock_download_photo
+):
+    # A carousel post, not a single photo - Instagram's post-specific "There
+    # is no video in this post" check only fires for a non-playlist post, so
+    # a carousel instead hits yt-dlp's generic core-level message. Confirmed
+    # live against a real 5-item mixed photo/video carousel, which raised
+    # this exact text verbatim.
+    mock_extract.side_effect = RuntimeError(
+        "[Instagram] abc123: No video formats found!; please report this issue on ..."
+    )
+    mock_download_photo.return_value = PhotoPostResult(
+        image_path="/tmp/photo_xyz/abc123.jpg", caption="A carousel caption", hashtags=[]
+    )
+
+    result = await download_media("https://www.instagram.com/p/abc123/")
+
+    assert result.success is True
+    assert result.file_path == "/tmp/photo_xyz/abc123.jpg"
+    mock_download_photo.assert_called_once_with("https://www.instagram.com/p/abc123/")
+    assert mock_extract.call_count == 1
+
+
+@patch("app.ingestion.media_downloader.download_photo_post")
+@patch("app.ingestion.media_downloader._extract_sync")
 async def test_download_media_reports_specific_error_when_instaloader_fallback_also_fails(
     mock_extract, mock_download_photo
 ):
