@@ -1,5 +1,5 @@
 # Current State
-**Last updated:** 2026-09-22 · after Sprint 18 (all 18 current-plan sprints done) + 4 Phase-1 retrofits + Streamlit frontend · commit `54478f8`
+**Last updated:** 2026-09-22 · after Sprint 18 (all 18 current-plan sprints done) + 4 Phase-1 retrofits + Streamlit frontend + photo-post message fix · commit `65d0df3`
 
 Living snapshot of what's actually true in the code right now. The other docs in
 this folder (`prd-v1-draft.md`, `phase1-2-functional-spec.md`,
@@ -450,6 +450,19 @@ queue — those remain explicitly deferred to Phase 4+.
   private, unpublished document either way. One data point; worth watching on
   future eval runs before treating as a real pattern.
 - **`GET /verdicts/{submission_id}`** not implemented (see §5).
+- **Instagram photo posts (no video) aren't supported via URL - by design for
+  now, not a bug.** `yt-dlp`'s Instagram extractor raises `"There is no video
+  in this post"` for a photo post/carousel on both the download and
+  metadata-only attempts - it parses the caption internally but discards it
+  before returning, once it sees there are no video formats. Found live via
+  the frontend's URL tab against two real photo-post URLs, both of which had
+  been getting the generic private/deleted/rate-limited message. Fixed to
+  detect this specific error (`media_downloader.NO_VIDEO_ERROR`) and tell the
+  user it's a photo post, suggesting the text tab as a workaround, rather than
+  building actual photo-post ingestion - the pipeline already has everything
+  needed downstream for a single image (Sprint 17's `analyze_image`), the gap
+  is purely that yt-dlp can't fetch an Instagram photo at all. Revisit if this
+  turns out to be common enough to justify a non-yt-dlp extraction path.
 
 ---
 
