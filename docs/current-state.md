@@ -1,5 +1,5 @@
 # Current State
-**Last updated:** 2026-09-22 · after Sprint 18 (all 18 current-plan sprints done) + 4 Phase-1 retrofits + Streamlit frontend + instaloader photo-post fallback + India-context credibility expansion · commit `dad93e2`
+**Last updated:** 2026-09-22 · after Sprint 18 (all 18 current-plan sprints done) + 4 Phase-1 retrofits + Streamlit frontend + instaloader photo-post fallback (+ carousel detection fix) + India-context credibility expansion · commit `af90d64`
 
 Living snapshot of what's actually true in the code right now. The other docs in
 this folder (`prd-v1-draft.md`, `phase1-2-functional-spec.md`,
@@ -94,9 +94,18 @@ both were removed rather than left unreachable. Verified live end-to-end
 against the exact two real photo-post URLs that originally surfaced this gap
 (a National Security Advisor speech post and a Bombay High Court ruling
 post) - both now return complete, real, cited verdicts instead of an error,
-via both the API directly and the Streamlit URL tab. Not yet verified live
-against a genuine multi-image carousel (only covered by mocked tests) - both
-real URLs used for verification happened to be single-image posts.
+via both the API directly and the Streamlit URL tab.
+
+**Follow-up fix, same day: carousel posts were still falling through to the
+generic failure message.** The Instagram-specific `"There is no video in
+this post"` error only fires for a single (non-carousel) post - Instagram's
+own extractor skips that check entirely when the post is a playlist/carousel
+type, so a carousel instead raises yt-dlp's differently-worded, generic
+core-level `"No video formats found!"` message, which `_is_no_video_error`
+didn't recognize. `_NO_VIDEO_MARKERS` now matches both. Confirmed live
+against a real 5-item *mixed* photo/video carousel (not just all-photo, as
+originally assumed) - it now correctly logs the carousel simplification,
+downloads the first image, and returns a real caption instead of failing.
 
 **Not tied to a sprint number: `source_credibility` expanded from ~30 to 67
 domains (Sep 2026), adding an India-context tier of sources.** Motivated by a
@@ -514,10 +523,19 @@ queue — those remain explicitly deferred to Phase 4+.
   `URL_PHOTO_POST_FALLBACK_FAILED_MESSAGE` failure path, same as before it
   existed. An authenticated (logged-in) `instaloader` session is a possible
   future lever if that happens, but needs a real Instagram account and was
-  explicitly out of scope for this pass. Also not yet confirmed live against
-  a genuine multi-image carousel - the first-image-only logic is covered by
-  mocked tests only (both real URLs used for live verification were
-  single-image posts).
+  explicitly out of scope for this pass. Carousel detection (both the
+  "no video" trigger and the first-image-only selection) is now confirmed
+  live against a real 5-item mixed photo/video carousel - see §1's follow-up
+  fix entry.
+- **`_pick_image_url`'s first-item selection doesn't check whether that item
+  is itself a video.** For a mixed carousel (confirmed real: photos and
+  videos in the same post), if the *first* sidecar item happens to be a
+  video rather than a photo, `display_url` on that node is only its
+  thumbnail frame, not the actual video - would silently treat a video's
+  static thumbnail as if it were a real photo post. Known and explicitly
+  deferred (not fixed) when the carousel-detection gap above was fixed -
+  the one real carousel used for live verification happened to have a photo
+  as its first item, so this specific edge case remains unexercised live.
 - **No relevance filter anywhere in the pipeline - only a for/against
   filter.** Confirmed live: a real claim's evidence_lines included an
   Anthropic cybersecurity blog post and a California wildfire-incidents page,
