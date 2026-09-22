@@ -58,6 +58,23 @@ requirements, and sprint plan. Each sprint's Claude Code prompt lives in
 runs fine without a Supabase project — the DB tests activate the moment
 `.env` has real values.
 
+## Running the frontend
+
+A simple Streamlit UI lives in [`frontend/`](frontend/). It calls the backend over
+HTTP, so it needs the API server running in a separate terminal:
+
+```bash
+# Terminal 1
+uvicorn app.main:app --reload
+
+# Terminal 2
+streamlit run frontend/streamlit_app.py
+```
+
+Streamlit opens at `http://localhost:8501`. It talks to the backend at the
+`API_BASE_URL` env var (defaults to `http://localhost:8000`, already set in
+`.env.example`).
+
 ## Tests
 
 ```bash
