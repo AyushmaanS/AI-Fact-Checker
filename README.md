@@ -5,7 +5,11 @@ PARTIALLY_TRUE, MISLEADING, UNVERIFIABLE, OUTDATED, or SATIRE — grounded in
 independently-verified sources. Every factual statement in a verdict must cite a
 source; uncited output is rejected before it reaches the response.
 
-Currently Phase 1 (raw text/caption in, no Instagram or video ingestion yet).
+Takes a claim as plain text, an Instagram URL (Reels, videos, and photo posts),
+or a directly uploaded video/image. Both Phase 1 (the research/verdict pipeline)
+and Phase 2 (Instagram/media ingestion) are done — see
+[`docs/current-state.md`](docs/current-state.md) for the full current picture.
+A Streamlit UI (see "Running the frontend" below) is the quickest way to try it.
 
 Planning docs live in [`docs/`](docs/): the PRD, functional spec, engineering
 requirements, and sprint plan. Each sprint's Claude Code prompt lives in
