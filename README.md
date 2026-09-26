@@ -46,10 +46,14 @@ requirements, and sprint plan. Each sprint's Claude Code prompt lives in
 ## Database (Supabase)
 
 1. Create a free project at [supabase.com](https://supabase.com).
-2. Open **SQL Editor** in the Supabase dashboard, paste in the contents of
-   [`app/db/schema.sql`](app/db/schema.sql), and run it. This creates the
-   `submissions`, `claims`, `verdicts`, and `source_credibility` tables and
-   seeds the credibility-weight table.
+2. Open **SQL Editor** in the Supabase dashboard, paste in the entire contents
+   of [`app/db/schema.sql`](app/db/schema.sql), and run it in one go. It's a
+   single self-contained script (safe to run once against a fresh project):
+   creates the `submissions`, `claims`, `verdicts`, and `source_credibility`
+   tables, seeds the 67-domain credibility-weight table (international +
+   India-context sources), creates the private `media` Storage bucket used for
+   temporarily-held video files, and adds the RLS policies that bucket needs
+   under the `anon` key.
 3. In **Project Settings → API**, copy the **Project URL** and the
    **anon/public API key**.
 4. Put them in `.env` as `SUPABASE_URL` and `SUPABASE_KEY`.
